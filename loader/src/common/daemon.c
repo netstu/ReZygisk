@@ -13,12 +13,7 @@
 int rezygiskd_connect(uint8_t retry) {
   retry++;
 
-  int fd = socket(PF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  if (fd == -1) {
-    PLOGE("socket create");
-
-    return -1;
-  }
+  const char *sock_path = TMP_PATH "/" SOCKET_FILE_NAME;
 
   struct sockaddr_un addr = {
     .sun_family = AF_UNIX,
@@ -31,12 +26,22 @@ int rezygiskd_connect(uint8_t retry) {
     Sources:
      - https://pubs.opengroup.org/onlinepubs/009696699/basedefs/sys/un.h.html
   */
-  strcpy(addr.sun_path, TMP_PATH "/" SOCKET_FILE_NAME);
+  strcpy(addr.sun_path, sock_path);
   socklen_t socklen = sizeof(addr);
 
   while (--retry) {
+    int fd = socket(PF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd == -1) {
+      PLOGE("socket create");
+
+      return -1;
+    }
+
     int ret = connect(fd, (struct sockaddr *)&addr, socklen);
     if (ret == 0) return fd;
+
+    close(fd);
+
     if (retry) {
       PLOGE("Retrying to connect to ReZygiskd, sleep 1s");
 
@@ -44,12 +49,10 @@ int rezygiskd_connect(uint8_t retry) {
     }
   }
 
-  close(fd);
-
   return -1;
 }
 
-bool rezygiskd_ping() {
+bool rezygiskd_zygote_injected() {
   int fd = rezygiskd_connect(5);
   if (fd == -1) {
     PLOGE("connection to ReZygiskd");
@@ -57,7 +60,7 @@ bool rezygiskd_ping() {
     return false;
   }
 
-  write_uint8_t(fd, (uint8_t)PingHeartbeat);
+  write_uint8_t(fd, (uint8_t)ZygoteInjected);
 
   close(fd);
 

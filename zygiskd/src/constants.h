@@ -1,11 +1,9 @@
 #ifndef CONSTANTS_H
 #define CONSTANTS_H
 
-#include <android/log.h>
+#include <stdbool.h>
 
-#define bool _Bool
-#define true 1
-#define false 0
+#include <android/log.h>
 
 #if (defined(__LP64__) || defined(_LP64))
   #define lp_select(a, b) b
@@ -21,7 +19,7 @@
 #define SYSTEM_SERVER_STARTED 10
 
 enum DaemonSocketAction {
-  PingHeartbeat          = 0,
+  ZygoteInjected         = 0,
   GetProcessFlags        = 1,
   GetInfo                = 2,
   ReadModules            = 3,

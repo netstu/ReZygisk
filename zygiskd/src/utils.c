@@ -10,6 +10,7 @@
 #include <sys/un.h>
 #include <sys/sysmacros.h>
 #include <sys/mount.h>
+#include <sys/xattr.h>
 
 #include <unistd.h>
 #include <linux/limits.h>
@@ -115,15 +116,15 @@ static void get_current_attr(char *restrict output, size_t size) {
   fclose(current);
 }
 
-void unix_datagram_sendto(const char *restrict path, void *restrict buf, size_t len) {
+void unix_datagram_sendto(const char *restrict path, const void *restrict buf, size_t len) {
   char current_attr[PATH_MAX];
   get_current_attr(current_attr, sizeof(current_attr));
 
   set_socket_create_context(current_attr);
 
-  struct sockaddr_un addr;
-  addr.sun_family = AF_UNIX;
-
+  struct sockaddr_un addr = {
+    .sun_family = AF_UNIX
+  };
   strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
 
   int socket_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
@@ -136,11 +137,15 @@ void unix_datagram_sendto(const char *restrict path, void *restrict buf, size_t 
   if (connect(socket_fd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
     LOGE("connect: %s\n", strerror(errno));
 
+    close(socket_fd);
+
     return;
   }
 
   if (sendto(socket_fd, buf, len, 0, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
     LOGE("sendto: %s\n", strerror(errno));
+
+    close(socket_fd);
 
     return;
   }
@@ -151,13 +156,10 @@ void unix_datagram_sendto(const char *restrict path, void *restrict buf, size_t 
 }
 
 int chcon(const char *restrict path, const char *context) {
-  char command[PATH_MAX];
-  snprintf(command, PATH_MAX, "chcon %s %s", context, path);
-
-  return system(command);
+  return lsetxattr(path, "security.selinux", context, strlen(context) + 1, 0);
 }
 
-int unix_listener_from_path(char *restrict path) {
+int unix_listener_from_path(const char *restrict path) {
   if (remove(path) == -1 && errno != ENOENT) {
     LOGE("remove: %s\n", strerror(errno));
 
@@ -179,20 +181,23 @@ int unix_listener_from_path(char *restrict path) {
   if (bind(socket_fd, (struct sockaddr *)&addr, sizeof(struct sockaddr_un)) == -1) {
     LOGE("bind: %s\n", strerror(errno));
 
+    close(socket_fd);
+
     return -1;
   }
 
   if (listen(socket_fd, 2) == -1) {
     LOGE("listen: %s\n", strerror(errno));
 
-    return -1;
-  }
-
-  if (chcon(path, "u:object_r:zygisk_file:s0") == -1) {
-    LOGE("chcon: %s\n", strerror(errno));
+    close(socket_fd);
 
     return -1;
   }
+
+  LOGI("socket listening on %s (fd=%d)", path, socket_fd);
+
+  if (chcon(path, "u:object_r:zygisk_file:s0") == -1)
+    LOGW("chcon (non-fatal): %s\n", strerror(errno));
 
   return socket_fd;
 }
@@ -200,7 +205,7 @@ int unix_listener_from_path(char *restrict path) {
 ssize_t write_fd(int fd, int sendfd) {
   char cmsgbuf[CMSG_SPACE(sizeof(int))];
   char buf[1] = { 0 };
-  
+
   struct iovec iov = {
     .iov_base = buf,
     .iov_len = 1
@@ -312,7 +317,7 @@ ssize_t read_string(int fd, char *restrict buf, size_t buf_size) {
 
     return -1;
   }
-  
+
   if (str_len > buf_size - 1) {
     LOGE("Failed to read string: Buffer is too small (%zu > %zu - 1).\n", str_len, buf_size);
 
@@ -457,17 +462,17 @@ struct mountinfo {
   unsigned int id;
   unsigned int parent;
   dev_t device;
-  const char *root;
-  const char *target;
-  const char *vfs_option;
+  char *root;
+  char *target;
+  char *vfs_option;
   struct {
       unsigned int shared;
       unsigned int master;
       unsigned int propagate_from;
   } optional;
-  const char *type;
-  const char *source;
-  const char *fs_option;
+  char *type;
+  char *source;
+  char *fs_option;
 };
 
 struct mountinfos {
@@ -487,15 +492,15 @@ char *strndup(const char *restrict str, size_t length) {
 
 void free_mounts(struct mountinfos *restrict mounts) {
   for (size_t i = 0; i < mounts->length; i++) {
-    free((void *)mounts->mounts[i].root);
-    free((void *)mounts->mounts[i].target);
-    free((void *)mounts->mounts[i].vfs_option);
-    free((void *)mounts->mounts[i].type);
-    free((void *)mounts->mounts[i].source);
-    free((void *)mounts->mounts[i].fs_option);
+    free(mounts->mounts[i].root);
+    free(mounts->mounts[i].target);
+    free(mounts->mounts[i].vfs_option);
+    free(mounts->mounts[i].type);
+    free(mounts->mounts[i].source);
+    free(mounts->mounts[i].fs_option);
   }
 
-  free((void *)mounts->mounts);
+  free(mounts->mounts);
 }
 
 bool parse_mountinfo(const char *restrict pid, struct mountinfos *restrict mounts) {
@@ -611,15 +616,15 @@ bool parse_mountinfo(const char *restrict pid, struct mountinfos *restrict mount
     continue;
 
     cleanup_source:
-      free((void *)mounts->mounts[i].source);
+      free(mounts->mounts[i].source);
     cleanup_type:
-      free((void *)mounts->mounts[i].type);
+      free(mounts->mounts[i].type);
     cleanup_vfs_option:
-      free((void *)mounts->mounts[i].vfs_option);
+      free(mounts->mounts[i].vfs_option);
     cleanup_target:
-      free((void *)mounts->mounts[i].target);
+      free(mounts->mounts[i].target);
     cleanup_root:
-      free((void *)mounts->mounts[i].root);
+      free(mounts->mounts[i].root);
     cleanup_mount_allocs:
       fclose(mountinfo);
       free_mounts(mounts);

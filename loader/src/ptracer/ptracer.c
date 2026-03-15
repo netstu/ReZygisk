@@ -1,19 +1,207 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <inttypes.h>
-
+#include <string.h>
+#include <fcntl.h>
 #include <sys/ptrace.h>
 #include <sys/auxv.h>
-#include <elf.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
 #include <link.h>
 #include <sys/wait.h>
-#include <dlfcn.h>
 #include <signal.h>
 
+#include <elf.h>
 #include <unistd.h>
+#include <linux/un.h>
 
 #include "utils.h"
 #include "misc.h"
+
+#include "remote_csoloader.h"
+#include "remote_csoloader_arm32.h"
+
+#ifdef __aarch64__
+
+/* TODO: I can't express how many detections this likely will have, but
+           it is not of high priority. 32-bit apps are going to phase out
+           eventually. However, we should investigate possible detections,
+           especially when using mprotect to register memory pages. */
+static bool inject_tango(int pid, const char *lib_path, uint32_t libc_init_target, uint32_t libc_init_got_slot) {
+  struct user_regs_struct regs = { 0 };
+  if (!get_regs(pid, &regs)) {
+    PLOGE("Failed to get registers");
+
+    return false;
+  }
+
+  struct user_regs_struct backup;
+  memcpy(&backup, &regs, sizeof(regs));
+
+  char maps_path[64];
+  snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+
+  struct maps *remote_map = parse_maps(maps_path);
+  if (!remote_map) {
+    LOGE("Failed to parse remote maps");
+
+    return false;
+  }
+
+  bool ok = false;
+  bool need_restore = true;
+
+  uint32_t lib_base = 0, lib_size = 0, lib_entry = 0;
+  if (!arm32_csoloader_load(pid, &regs, remote_map, lib_path, &lib_base, &lib_size, &lib_entry)) {
+    LOGE("Failed to load %s", lib_path);
+
+    goto tango_done;
+  }
+
+  LOGD("Mapped %s at 0x%x (size: 0x%x, entry=0x%x)", lib_path, lib_base, lib_size, lib_entry);
+
+  if (!lib_entry) {
+    LOGE("Failed to find 'entry' symbol in %s", lib_path);
+
+    goto tango_done;
+  }
+
+  /* INFO: Tango translator intercepts both BKPT and UDF in userspace, before it
+             can even raise SIGTRAP to the tracer. To bypass this, we use the
+             kill(getpid(), SIGTRAP) trick which goes through the kernel's normal
+             signal delivery path, allowing the tracer to catch it. */
+  uint32_t code[] = {
+    /* INFO: Call mprotect syscall to register the libzygisk.so memory pages */
+    0x4807B5FF, /* PUSH {r0-r7,lr} ; LDR r0,[PC,#28] → data[0]    */
+    0x22074907, /* LDR r1,[PC,#28] → data[1] ; MOVS r2,#7 (RWX)   */
+    0xDF00277D, /* MOVS r7,#125 (__NR_mprotect) ; SVC #0           */
+    /* INFO: Call the libzygisk.so entry function */
+    0x49054804, /* LDR r0,[PC,#16] → data[0] ; LDR r1,[PC,#20] → data[1] */
+    0x4B052201, /* MOVS r2,#1 (tango) ; LDR r3,[PC,#20] → data[2] */
+    /* INFO: Call kill(getpid(), SIGTRAP) to trigger SIGTRAP */
+    0x27144798, /* BLX r3 ; MOVS r7,#20 (__NR_getpid)              */
+    0x2105DF00, /* SVC #0 (getpid) ; MOVS r1,#5 (SIGTRAP)          */
+    0xDF002725, /* MOVS r7,#37 (__NR_kill) ; SVC #0                 */
+    /* INFO: Data for the code above (lib_base, lib_size, lib_entry) */
+    lib_base,
+    lib_size,
+    lib_entry | 1,
+    0,          /* INFO: Placeholder for the stub's later use */
+  };
+
+  uint32_t tramp = 0;
+  for (size_t i = 0; i < remote_map->size && !tramp; i++) {
+    const struct map *map = &remote_map->maps[i];
+    if (!map->path || !(map->perms & PROT_EXEC) || (uintptr_t)map->start >= 0x100000000ULL) continue;
+
+    tramp = find_tramp_padding(pid, (uint32_t)(uintptr_t)map->start, (uint32_t)(uintptr_t)map->end, sizeof(code));
+  }
+
+  if (!tramp) {
+    LOGE("Failed to find enough executable padding for trampoline (%zu bytes)", sizeof(code));
+
+    goto tango_done;
+  }
+
+  for (size_t i = 0; i < sizeof(code) / sizeof(code[0]); i++) {
+    if (ptrace_poke_u32(pid, (uintptr_t)(tramp + i * 4), code[i])) continue;
+
+    LOGE("Failed to write trampoline word %zu", i);
+
+    goto tango_done;
+  }
+
+  LOGD("GOT hook __libc_init in app_process32 (0x%x to trampoline 0x%x)", libc_init_target, tramp | 1);
+
+  uint32_t tramp_thumb = tramp | 1;
+  if (write_proc(pid, (uintptr_t)libc_init_got_slot, &tramp_thumb, 4) != 4 && !ptrace_poke_u32(pid, (uintptr_t)libc_init_got_slot, tramp_thumb)) {
+    LOGE("Failed to patch GOT entry at 0x%x with %d: %s", libc_init_got_slot, errno, strerror(errno));
+
+    goto tango_done;
+  }
+
+  (void)set_regs(pid, &backup);
+
+  need_restore = false;
+
+  if (ptrace(PTRACE_CONT, pid, 0, 0) == -1) {
+    PLOGE("PTRACE_CONT for trampoline execution");
+
+    goto tango_done;
+  }
+
+  /* INFO: Wait for it to get to __libc_init, which then goes to its GOT which
+             then executes our trampoline. After executing our trampoline, it
+             executes libzygisk.so entry, and after that, we raise a SIGTRAP
+             event with kill(...), which here, we wait for it, to then do
+             the cleanup. */
+  while (1) {
+    int status;
+    wait_for_trace(pid, &status, __WALL);
+
+    if (!WIFSTOPPED(status)) {
+      LOGE("Process %d exited during trampoline (status 0x%x)", pid, status);
+
+      goto tango_done;
+    }
+
+    int sig   = WSTOPSIG(status);
+    int event = (status >> 16) & 0xFF;
+    /* INFO: Catch the SIGTRAP generated by the kill() call */
+    if (sig == SIGTRAP && event == 0)
+      break;
+
+    ptrace(PTRACE_CONT, pid, 0, event ? 0 : sig);
+  }
+
+  LOGD("Caught trampoline SIGTRAP");
+
+  /* INFO: Clean the trampoline after catching the SIGTRAP to avoid detections */
+  for (size_t i = 0; i < sizeof(code) / sizeof(code[0]); i++)
+    ptrace_poke_u32(pid, (uintptr_t)(tramp + i * 4), 0);
+
+  /* INFO: Also clean the GOT entry */
+  if (!ptrace_poke_u32(pid, (uintptr_t)libc_init_got_slot, libc_init_target))
+    LOGW("Failed to restore GOT at 0x%x", libc_init_got_slot);
+
+  LOGD("Restored __libc_init GOT entry and zeroed trampoline");
+
+  /* INFO: Tango translator maintains memory-side state that would go out of sync if we
+             rewind execution via set_regs, so instead we write a tiny tail-call stub
+             at the end of the trampoline's data that jumps forward into __libc_init. */
+  ptrace_poke_u32(pid, (uintptr_t)(tramp + 32), 0x40FFE8BD /* POP.W {r0-r7,lr}   */);
+  ptrace_poke_u32(pid, (uintptr_t)(tramp + 36), 0xC004F8DF /* LDR.W r12,[PC,#4]  */);
+  ptrace_poke_u32(pid, (uintptr_t)(tramp + 40), 0x00004760 /* BX r12 ; (padding) */);
+  ptrace_poke_u32(pid, (uintptr_t)(tramp + 44), libc_init_target);
+
+  if (ptrace(PTRACE_SYSCALL, pid, 0, 0) == -1) {
+    PLOGE("PTRACE_SYSCALL for tail-call stub");
+
+    ok = true;
+
+    goto tango_done;
+  }
+
+  if (!tango_step_to_syscall(pid)) {
+    LOGE("Process %d died waiting for post-stub syscall", pid);
+
+    goto tango_done;
+  }
+
+  /* Zero the stub */
+  for (size_t i = 0; i < 4; i++)
+    ptrace_poke_u32(pid, (uintptr_t)(tramp + 32 + i * 4), 0);
+
+  ok = true;
+
+  tango_done:
+    free_maps(remote_map);
+
+    if (need_restore) (void)set_regs(pid, &backup);
+
+    return ok;
+}
+#endif
 
 bool inject_on_main(int pid, const char *lib_path) {
   LOGI("injecting %s to zygote %d", lib_path, pid);
@@ -156,149 +344,27 @@ bool inject_on_main(int pid, const char *lib_path) {
     void *libc_return_addr = find_module_return_addr(map, "libc.so");
     LOGD("libc return addr %p", libc_return_addr);
 
-    const char *libdl_path = NULL;
     const char *libc_path = NULL;
     for (size_t i = 0; i < map->size; i++) {
       if (map->maps[i].path == NULL) continue;
 
       const char *filename = position_after(map->maps[i].path, '/');
-
-      if (!libdl_path && strcmp(filename, "libdl.so") == 0) {
-        libdl_path = map->maps[i].path;
-
-        LOGD("found libdl.so at %s", libdl_path);
-
-        /* INFO: If we had found libc.so too, no need to continue searching */
-        if (libc_path) break;
-
-        continue;
-      }
-
-      if (!libc_path && strcmp(filename, "libc.so") == 0) {
+      if (strcmp(filename, "libc.so") == 0) {
         libc_path = map->maps[i].path;
 
         LOGD("found libc.so at %s", libc_path);
 
-        /* INFO: If we had found libdl.so too, no need to continue searching */
-        if (libdl_path) break;
-
-        continue;
+        break;
       }
     }
 
-    /* call dlopen */
-    void *dlopen_addr = NULL;
-    if (!libdl_path || (dlopen_addr = find_func_addr(local_map, map, libdl_path, "dlopen")) == NULL) {
-      /* INFO: Android 7.1 and below doesn't have libdl.so loaded in Zygote */
-      LOGW("Failed to find dlopen from libdl.so, will load from linker");
+    uintptr_t remote_base = 0;
+    size_t remote_size = 0;
+    uintptr_t injector_entry = 0;
 
-      #ifdef __LP64__
-        dlopen_addr = find_func_addr(local_map, map, "/system/bin/linker64", "__dl_dlopen");
-      #else
-        dlopen_addr = find_func_addr(local_map, map, "/system/bin/linker", "__dl_dlopen");
-      #endif
-      if (dlopen_addr == NULL) {
-        PLOGE("Find __dl_dlopen");
-
-        free_maps(local_map);
-        free_maps(map);
-
-        return false;
-      }
-    }
-
-    long *args = (long *)malloc(3 * sizeof(long));
-    if (args == NULL) {
-      LOGE("malloc args");
-
-      return false;
-    }
-
-    uintptr_t str = push_string(pid, &regs, lib_path);
-
-    args[0] = (long) str;
-    args[1] = (long) RTLD_NOW;
-
-    uintptr_t remote_handle = remote_call(pid, &regs, (uintptr_t)dlopen_addr, (uintptr_t)libc_return_addr, args, 2);
-    LOGD("remote handle %p", (void *)remote_handle);
-    if (remote_handle == 0) {
-      LOGE("handle is null");
-
-      /* call dlerror */
-      void *dlerror_addr = NULL;
-      if (!libdl_path || (dlerror_addr = find_func_addr(local_map, map, libdl_path, "dlerror")) == NULL) {
-        /* INFO: Android 7.1 and below doesn't have libdl.so loaded in Zygote */
-        LOGW("Failed to find dlerror from libdl.so, will load from linker");
-
-        #ifdef __LP64__
-          dlerror_addr = find_func_addr(local_map, map, "/system/bin/linker64", "__dl_dlerror");
-        #else
-          dlerror_addr = find_func_addr(local_map, map, "/system/bin/linker", "__dl_dlerror");
-        #endif
-        if (dlerror_addr == NULL) {
-          LOGE("Find __dl_dlerror");
-
-          free(args);
-          free_maps(local_map);
-          free_maps(map);
-
-          return false;
-        }
-      }
-
-      uintptr_t dlerror_str_addr = remote_call(pid, &regs, (uintptr_t)dlerror_addr, (uintptr_t)libc_return_addr, args, 0);
-      LOGD("dlerror str %p", (void *)dlerror_str_addr);
-      if (dlerror_str_addr == 0) {
-        LOGE("dlerror str is null");
-
-        free(args);
-        free_maps(local_map);
-        free_maps(map);
-
-        return false;
-      }
-
-      void *strlen_addr = find_func_addr(local_map, map, libc_path, "strlen");
-      if (strlen_addr == NULL) {
-        LOGE("find strlen");
-
-        free(args);
-        free_maps(local_map);
-        free_maps(map);
-
-        return false;
-      }
-
-      args[0] = (long) dlerror_str_addr;
-
-      uintptr_t dlerror_len = remote_call(pid, &regs, (uintptr_t)strlen_addr, (uintptr_t)libc_return_addr, args, 1);
-      if (dlerror_len <= 0) {
-        LOGE("dlerror len <= 0");
-
-        free(args);
-        free_maps(local_map);
-        free_maps(map);
-
-        return false;
-      }
-
-      char *err = (char *)malloc((dlerror_len + 1) * sizeof(char));
-      if (err == NULL) {
-        LOGE("malloc err");
-
-        free(args);
-        free_maps(local_map);
-        free_maps(map);
-
-        return false;
-      }
-
-      read_proc(pid, dlerror_str_addr, err, dlerror_len + 1);
-
-      LOGE("dlerror info %s", err);
-
-      free(err);
-      free(args);
+    if (!remote_csoloader_load_and_resolve_entry(pid, &regs, (uintptr_t)libc_return_addr, local_map, map, libc_path, lib_path,
+                                                 &remote_base, &remote_size, &injector_entry)) {
+      LOGE("remote CSOLoader mapping failed");
 
       free_maps(local_map);
       free_maps(map);
@@ -306,68 +372,44 @@ bool inject_on_main(int pid, const char *lib_path) {
       return false;
     }
 
-    /* call dlsym(handle, "entry") */
-    void *dlsym_addr = NULL;
-    if (!libdl_path || (dlsym_addr = find_func_addr(local_map, map, libdl_path, "dlsym")) == NULL) {
-      /* INFO: Android 7.1 and below doesn't have libdl.so loaded in Zygote */
-      LOGW("Failed to find dlsym from libdl.so, will load from linker");
-
-      #ifdef __LP64__
-        dlsym_addr = find_func_addr(local_map, map, "/system/bin/linker64", "__dl_dlsym");
-      #else
-        dlsym_addr = find_func_addr(local_map, map, "/system/bin/linker", "__dl_dlsym");
-      #endif
-      if (dlsym_addr == NULL) {
-        LOGE("find __dl_dlsym");
-
-        free(args);
-        free_maps(local_map);
-        free_maps(map);
-
-        return false;
-      }
-    }
-
     free_maps(local_map);
+    free_maps(map);
 
-    str = push_string(pid, &regs, "entry");
-    args[0] = remote_handle;
-    args[1] = (long) str;
+    long args[3];
+    args[0] = (long)remote_base;
+    args[1] = (long)remote_size;
+    args[2] = 0; /* INFO: tango_flag */
 
-    uintptr_t injector_entry = remote_call(pid, &regs, (uintptr_t)dlsym_addr, (uintptr_t)libc_return_addr, args, 2);
-    LOGD("injector entry %p", (void *)injector_entry);
-    if (injector_entry == 0) {
-      LOGE("injector entry is null");
+    remote_call(pid, &regs, injector_entry, (uintptr_t)libc_return_addr, args, 3);
+
+    /* INFO: remote_call uses a deliberate SIGSEGV on an invalid return address to regain control.
+               If the call faults elsewhere (e.g., inside injector code), REG_IP won't match. */
+    bool injector_ok = false;
+    #if defined(__arm__)
+      injector_ok = (((uintptr_t)regs.REG_IP & ~1u) == ((uintptr_t)libc_return_addr & ~1u));
+    #else
+      injector_ok = ((uintptr_t)regs.REG_IP == (uintptr_t)libc_return_addr);
+    #endif
+    if (!injector_ok) {
+      char stopped_region[1024];
+      struct maps *map_after = parse_maps(pid_maps);
+      if (map_after) {
+        get_addr_mem_region(map_after, (uintptr_t)regs.REG_IP, stopped_region, sizeof(stopped_region));
+
+        free_maps(map_after);
+      } else {
+        snprintf(stopped_region, sizeof(stopped_region), "<maps unavailable>");
+      }
+
+      LOGE("injector entry faulted at %p (%s)", (void *)regs.REG_IP, stopped_region);
+
+      /* INFO: Restore registers before reporting failure. */
+      backup.REG_IP = (long)entry_addr;
+
+      (void)set_regs(pid, &backup);
 
       return false;
     }
-
-    /* INFO: Record the address range of libzygisk.so */
-    map = parse_maps(pid_maps);
-
-    void *start_addr = NULL;
-    size_t block_size = 0;
-
-    for (size_t i = 0; i < map->size; i++) {
-      if (!strstr(map->maps[i].path, "libzygisk.so")) continue;
-
-      if (start_addr == NULL) start_addr = (void *)map->maps[i].start;
-
-      size_t size = map->maps[i].end - map->maps[i].start;
-      block_size += size;
-
-      LOGD("found block %s: [%p-%p] with size %zu", map->maps[i].path, (void *)map->maps[i].start, (void *)map->maps[i].end, size);
-    }
-
-    free_maps(map);
-
-    /* INFO: Call entry(start_addr, block_size) */
-    args[0] = (uintptr_t)start_addr;
-    args[1] = block_size;
-
-    remote_call(pid, &regs, injector_entry, (uintptr_t)libc_return_addr, args, 2);
-
-    free(args);
 
     /* INFO: Reset pc to entry */
     backup.REG_IP = (long) entry_addr;
@@ -396,20 +438,39 @@ bool inject_on_main(int pid, const char *lib_path) {
     return false;                             \
   }
 
-bool trace_zygote(int pid) {
+bool trace_zygote(int pid, bool tango_flag) {
   LOGI("start tracing %d (tracer %d)", pid, getpid());
 
   int status;
 
   struct kernel_version version = parse_kversion();
   if (version.major > 3 || (version.major == 3 && version.minor >= 8)) {
-    if (ptrace(PTRACE_SEIZE, pid, 0, PTRACE_O_EXITKILL | PTRACE_O_TRACESECCOMP) == -1) {
-      PLOGE("seize");
+    #ifdef __aarch64__
+      if (tango_flag) {
+        /* INFO: For tango injection, we need to seize with PTRACE_O_TRACESYSGOOD to
+                   reliably catch the translator's entry point. */
+         if (ptrace(PTRACE_SEIZE, pid, 0, PTRACE_O_EXITKILL | PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACESECCOMP) == -1) {
+          PLOGE("seize for tango");
 
-      return false;
-    }
+          return false;
+        }
+      } else {
+        if (ptrace(PTRACE_SEIZE, pid, 0, PTRACE_O_EXITKILL | PTRACE_O_TRACESECCOMP) == -1) {
+          PLOGE("seize");
 
-    WAIT_OR_DIE;
+          return false;
+        }
+
+        WAIT_OR_DIE;
+      }
+    #else
+      if (ptrace(PTRACE_SEIZE, pid, 0, PTRACE_O_EXITKILL | PTRACE_O_TRACESECCOMP) == -1) {
+        PLOGE("seize");
+        return false;
+      }
+
+      WAIT_OR_DIE;
+    #endif
   } else {
     if (ptrace(PTRACE_SEIZE, pid, 0, 0) == -1) {
       PLOGE("seize");
@@ -420,10 +481,64 @@ bool trace_zygote(int pid) {
     WAIT_OR_DIE;
   }
 
-  if (STOPPED_WITH(SIGSTOP, PTRACE_EVENT_STOP)) {
-    char lib_path[PATH_MAX];
-    snprintf(lib_path, sizeof(lib_path), "%s/lib" LP_SELECT("", "64") "/libzygisk.so", rezygiskd_get_path());
+  #ifdef __aarch64__
+    if (tango_flag) {
+      if (ptrace(PTRACE_INTERRUPT, pid, 0, 0) == -1) {
+        PLOGE("interrupt");
 
+        ptrace(PTRACE_DETACH, pid, 0, 0);
+
+        return false;
+      }
+
+      /* INFO: Drain to INTERRUPT's SIGTRAP + EVENT_STOP */
+      if (!tango_drain_to_event_stop(pid)) {
+        LOGE("Failed to drain to event stop for tango injection");
+
+        ptrace(PTRACE_DETACH, pid, 0, SIGCONT);
+
+        return false;
+      }
+
+      struct tango_linker_watch watch = { 0 };
+      if (!tango_wait_linker_ready(pid, &watch)) {
+        LOGE("Failed to wait for linker ready for injection");
+
+        ptrace(PTRACE_DETACH, pid, 0, SIGCONT);
+
+        return false;
+      }
+
+      /* INFO: Leave syscall-stop state before injection */
+      ptrace(PTRACE_CONT, pid, 0, 0);
+      if (ptrace(PTRACE_INTERRUPT, pid, 0, 0) == -1) {
+        PLOGE("Failed to interrupt process for injection");
+
+        ptrace(PTRACE_DETACH, pid, 0, SIGCONT);
+
+        return false;
+      }
+
+      if (!tango_drain_to_event_stop(pid)) {
+        LOGE("Failed to drain to event stop for injection");
+
+        ptrace(PTRACE_DETACH, pid, 0, SIGCONT);
+
+        return false;
+      }
+
+      const char *lib_path = "/data/adb/modules/rezygisk/lib/libzygisk.so";
+      bool result = inject_tango(pid, lib_path, watch.libc_init_resolved, watch.libc_init_got_slot);
+      if (!result) LOGE("Failed to inject tango");
+
+      ptrace(PTRACE_DETACH, pid, 0, SIGCONT);
+
+      return result;
+    }
+  #endif /* __aarch64__ */
+
+  if (STOPPED_WITH(SIGSTOP, PTRACE_EVENT_STOP)) {
+    char *lib_path = "/data/adb/modules/rezygisk/lib" LP_SELECT("", "64") "/libzygisk.so";
     if (!inject_on_main(pid, lib_path)) {
       LOGE("failed to inject");
 
