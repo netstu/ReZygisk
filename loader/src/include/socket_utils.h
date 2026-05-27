@@ -3,16 +3,20 @@
 
 #include <stdint.h>
 
+#include <sys/types.h>
+
 ssize_t write_loop(int fd, const void *buf, size_t count);
 
 ssize_t read_loop_offset(int fd, void *buf, size_t len, off_t off);
 
 ssize_t read_loop(int fd, void *buf, size_t len);
 
+ssize_t write_fd(int fd, int sendfd);
+
 int read_fd(int fd);
 
 ssize_t write_string(int fd, const char *str);
-  
+
 char *read_string(int fd);
 
 #define write_func_def(type)              \

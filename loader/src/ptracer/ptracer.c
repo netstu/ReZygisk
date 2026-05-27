@@ -1,27 +1,22 @@
 #include <stdio.h>
-#include <stdlib.h>
 #include <inttypes.h>
 #include <string.h>
-#include <fcntl.h>
-#include <sys/ptrace.h>
-#include <sys/auxv.h>
-#include <sys/mman.h>
-#include <sys/socket.h>
+
 #include <link.h>
-#include <sys/wait.h>
 #include <signal.h>
+#include <sys/mman.h>
+#include <sys/ptrace.h>
+#include <sys/wait.h>
 
 #include <elf.h>
 #include <unistd.h>
-#include <linux/un.h>
 
-#include "utils.h"
+#define LOG_TAG "zygisk-injector" LP_SELECT("32", "64")
+
 #include "misc.h"
+#include "utils.h"
 
 #include "remote_csoloader.h"
-#include "remote_csoloader_arm32.h"
-
-#ifdef __aarch64__
 
 /* TODO: I can't express how many detections this likely will have, but
            it is not of high priority. 32-bit apps are going to phase out
@@ -38,12 +33,22 @@ static bool inject_tango(int pid, const char *lib_path, uint32_t libc_init_targe
   struct user_regs_struct backup;
   memcpy(&backup, &regs, sizeof(regs));
 
-  char maps_path[64];
-  snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+  /* INFO: The character limit for a 32-bit integer is 10 */
+  char pid_str[10 + 1];
+  snprintf(pid_str, sizeof(pid_str), "%d", pid);
 
-  struct maps *remote_map = parse_maps(maps_path);
+  struct maps_info *remote_map = parse_maps(pid_str);
   if (!remote_map) {
-    LOGE("Failed to parse remote maps");
+    LOGE("Failed to parse remote maps for pid %d", pid);
+
+    return false;
+  }
+
+  struct maps_info *local_map = parse_maps("self");
+  if (!local_map) {
+    LOGE("Failed to parse local maps");
+
+    free_maps(remote_map);
 
     return false;
   }
@@ -51,12 +56,17 @@ static bool inject_tango(int pid, const char *lib_path, uint32_t libc_init_targe
   bool ok = false;
   bool need_restore = true;
 
-  uint32_t lib_base = 0, lib_size = 0, lib_entry = 0;
-  if (!arm32_csoloader_load(pid, &regs, remote_map, lib_path, &lib_base, &lib_size, &lib_entry)) {
+  uintptr_t mapped_base = 0, mapped_entry = 0;
+  size_t mapped_size = 0;
+  if (!remote_csoloader_load_and_resolve_entry(pid, &regs, remote_map, local_map, lib_path, &mapped_base, &mapped_size, &mapped_entry)) {
     LOGE("Failed to load %s", lib_path);
 
     goto tango_done;
   }
+
+  uint32_t lib_base = (uint32_t)mapped_base;
+  uint32_t lib_size = (uint32_t)mapped_size;
+  uint32_t lib_entry = (uint32_t)mapped_entry;
 
   LOGD("Mapped %s at 0x%x (size: 0x%x, entry=0x%x)", lib_path, lib_base, lib_size, lib_entry);
 
@@ -85,13 +95,17 @@ static bool inject_tango(int pid, const char *lib_path, uint32_t libc_init_targe
     /* INFO: Data for the code above (lib_base, lib_size, lib_entry) */
     lib_base,
     lib_size,
-    lib_entry | 1,
+    /* INFO: add | 1 would make it enter thumb mode */
+    lib_entry,
+    #if 0
+      lib_entry | 1,
+    #endif
     0,          /* INFO: Placeholder for the stub's later use */
   };
 
   uint32_t tramp = 0;
-  for (size_t i = 0; i < remote_map->size && !tramp; i++) {
-    const struct map *map = &remote_map->maps[i];
+  for (size_t i = 0; i < remote_map->length && !tramp; i++) {
+    const struct map_entry *map = &remote_map->maps[i];
     if (!map->path || !(map->perms & PROT_EXEC) || (uintptr_t)map->start >= 0x100000000ULL) continue;
 
     tramp = find_tramp_padding(pid, (uint32_t)(uintptr_t)map->start, (uint32_t)(uintptr_t)map->end, sizeof(code));
@@ -115,12 +129,16 @@ static bool inject_tango(int pid, const char *lib_path, uint32_t libc_init_targe
 
   uint32_t tramp_thumb = tramp | 1;
   if (write_proc(pid, (uintptr_t)libc_init_got_slot, &tramp_thumb, 4) != 4 && !ptrace_poke_u32(pid, (uintptr_t)libc_init_got_slot, tramp_thumb)) {
-    LOGE("Failed to patch GOT entry at 0x%x with %d: %s", libc_init_got_slot, errno, strerror(errno));
+    PLOGE("Patch GOT entry at 0x%x", libc_init_got_slot);
 
     goto tango_done;
   }
 
-  (void)set_regs(pid, &backup);
+  if (!set_regs(pid, &backup)) {
+    LOGE("Failed to restore regs before trampoline run");
+
+    goto tango_done;
+  }
 
   need_restore = false;
 
@@ -151,7 +169,11 @@ static bool inject_tango(int pid, const char *lib_path, uint32_t libc_init_targe
     if (sig == SIGTRAP && event == 0)
       break;
 
-    ptrace(PTRACE_CONT, pid, 0, event ? 0 : sig);
+    if (ptrace(PTRACE_CONT, pid, 0, event ? 0 : sig) == -1) {
+      PLOGE("PTRACE_CONT while waiting trampoline SIGTRAP");
+
+      goto tango_done;
+    }
   }
 
   LOGD("Caught trampoline SIGTRAP");
@@ -182,7 +204,8 @@ static bool inject_tango(int pid, const char *lib_path, uint32_t libc_init_targe
     goto tango_done;
   }
 
-  if (!tango_step_to_syscall(pid)) {
+  int post_stub_status = 0;
+  if (!wait_for_ptrace_syscall_stop(pid, &post_stub_status)) {
     LOGE("Process %d died waiting for post-stub syscall", pid);
 
     goto tango_done;
@@ -196,12 +219,12 @@ static bool inject_tango(int pid, const char *lib_path, uint32_t libc_init_targe
 
   tango_done:
     free_maps(remote_map);
+    free_maps(local_map);
 
     if (need_restore) (void)set_regs(pid, &backup);
 
     return ok;
 }
-#endif
 
 bool inject_on_main(int pid, const char *lib_path) {
   LOGI("injecting %s to zygote %d", lib_path, pid);
@@ -214,10 +237,11 @@ bool inject_on_main(int pid, const char *lib_path) {
 
   struct user_regs_struct regs = { 0 };
 
-  char pid_maps[PATH_MAX];
-  snprintf(pid_maps, sizeof(pid_maps), "/proc/%d/maps", pid);
+  /* INFO: The character limit for a 32-bit integer is 10 */
+  char pid_str[10 + 1];
+  snprintf(pid_str, sizeof(pid_str), "%d", pid);
 
-  struct maps *map = parse_maps(pid_maps);
+  struct maps_info *map = parse_maps(pid_str);
   if (map == NULL) {
     LOGE("failed to parse remote maps");
 
@@ -327,14 +351,14 @@ bool inject_on_main(int pid, const char *lib_path) {
 
     free_maps(map);
 
-    map = parse_maps(pid_maps);
+    map = parse_maps(pid_str);
     if (!map) {
       LOGE("failed to parse remote maps");
 
       return false;
     }
 
-    struct maps *local_map = parse_maps("/proc/self/maps");
+    struct maps_info *local_map = parse_maps("self");
     if (!local_map) {
       LOGE("failed to parse local maps");
 
@@ -344,26 +368,11 @@ bool inject_on_main(int pid, const char *lib_path) {
     void *libc_return_addr = find_module_return_addr(map, "libc.so");
     LOGD("libc return addr %p", libc_return_addr);
 
-    const char *libc_path = NULL;
-    for (size_t i = 0; i < map->size; i++) {
-      if (map->maps[i].path == NULL) continue;
-
-      const char *filename = position_after(map->maps[i].path, '/');
-      if (strcmp(filename, "libc.so") == 0) {
-        libc_path = map->maps[i].path;
-
-        LOGD("found libc.so at %s", libc_path);
-
-        break;
-      }
-    }
-
     uintptr_t remote_base = 0;
     size_t remote_size = 0;
     uintptr_t injector_entry = 0;
 
-    if (!remote_csoloader_load_and_resolve_entry(pid, &regs, (uintptr_t)libc_return_addr, local_map, map, libc_path, lib_path,
-                                                 &remote_base, &remote_size, &injector_entry)) {
+    if (!remote_csoloader_load_and_resolve_entry(pid, &regs, map, local_map, lib_path, &remote_base, &remote_size, &injector_entry)) {
       LOGE("remote CSOLoader mapping failed");
 
       free_maps(local_map);
@@ -392,7 +401,7 @@ bool inject_on_main(int pid, const char *lib_path) {
     #endif
     if (!injector_ok) {
       char stopped_region[1024];
-      struct maps *map_after = parse_maps(pid_maps);
+      struct maps_info *map_after = parse_maps(pid_str);
       if (map_after) {
         get_addr_mem_region(map_after, (uintptr_t)regs.REG_IP, stopped_region, sizeof(stopped_region));
 
@@ -449,7 +458,7 @@ bool trace_zygote(int pid, bool tango_flag) {
       if (tango_flag) {
         /* INFO: For tango injection, we need to seize with PTRACE_O_TRACESYSGOOD to
                    reliably catch the translator's entry point. */
-         if (ptrace(PTRACE_SEIZE, pid, 0, PTRACE_O_EXITKILL | PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACESECCOMP) == -1) {
+        if (ptrace(PTRACE_SEIZE, pid, 0, PTRACE_O_EXITKILL | PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACESECCOMP) == -1) {
           PLOGE("seize for tango");
 
           return false;
@@ -464,12 +473,17 @@ bool trace_zygote(int pid, bool tango_flag) {
         WAIT_OR_DIE;
       }
     #else
-      if (ptrace(PTRACE_SEIZE, pid, 0, PTRACE_O_EXITKILL | PTRACE_O_TRACESECCOMP) == -1) {
-        PLOGE("seize");
+      long seize_opts = PTRACE_O_EXITKILL | PTRACE_O_TRACESECCOMP;
+      if (tango_flag) seize_opts |= PTRACE_O_TRACESYSGOOD;
+
+      if (ptrace(PTRACE_SEIZE, pid, 0, seize_opts) == -1) {
+        if (tango_flag) PLOGE("seize for tango");
+        else PLOGE("seize");
+
         return false;
       }
 
-      WAIT_OR_DIE;
+      if (!tango_flag) WAIT_OR_DIE;
     #endif
   } else {
     if (ptrace(PTRACE_SEIZE, pid, 0, 0) == -1) {
@@ -481,7 +495,6 @@ bool trace_zygote(int pid, bool tango_flag) {
     WAIT_OR_DIE;
   }
 
-  #ifdef __aarch64__
     if (tango_flag) {
       if (ptrace(PTRACE_INTERRUPT, pid, 0, 0) == -1) {
         PLOGE("interrupt");
@@ -492,7 +505,7 @@ bool trace_zygote(int pid, bool tango_flag) {
       }
 
       /* INFO: Drain to INTERRUPT's SIGTRAP + EVENT_STOP */
-      if (!tango_drain_to_event_stop(pid)) {
+      if (!wait_for_event_stop(pid)) {
         LOGE("Failed to drain to event stop for tango injection");
 
         ptrace(PTRACE_DETACH, pid, 0, SIGCONT);
@@ -519,7 +532,7 @@ bool trace_zygote(int pid, bool tango_flag) {
         return false;
       }
 
-      if (!tango_drain_to_event_stop(pid)) {
+      if (!wait_for_event_stop(pid)) {
         LOGE("Failed to drain to event stop for injection");
 
         ptrace(PTRACE_DETACH, pid, 0, SIGCONT);
@@ -535,7 +548,6 @@ bool trace_zygote(int pid, bool tango_flag) {
 
       return result;
     }
-  #endif /* __aarch64__ */
 
   if (STOPPED_WITH(SIGSTOP, PTRACE_EVENT_STOP)) {
     char *lib_path = "/data/adb/modules/rezygisk/lib" LP_SELECT("", "64") "/libzygisk.so";

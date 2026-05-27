@@ -1,186 +1,27 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <errno.h>
-#include <inttypes.h>
-#include <ctype.h>
 #include <stddef.h>
 #include <string.h>
+#include <errno.h>
 
-#include <sys/sysmacros.h>
-#include <sys/ptrace.h>
-#include <sys/mman.h>
-#include <sys/time.h>
-#include <sys/wait.h>
-#include <sys/stat.h>
-#include <sys/auxv.h>
-#include <sys/uio.h>
-#include <signal.h>
-#include <dlfcn.h>
-#include <sched.h>
-#include <fcntl.h>
-#include <link.h>
-
-#include <unistd.h>
+#include <ctype.h>
+#include <inttypes.h>
 #include <linux/limits.h>
 
+#include <fcntl.h>
+#include <link.h>
+#include <signal.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/ptrace.h>
+#include <sys/sysmacros.h>
+#include <sys/uio.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+
 #include "elf_util.h"
-#include "elf_util_32.h"
 
 #include "utils.h"
-
-bool switch_mnt_ns(int pid, int *fd) {
-  int nsfd, old_nsfd = -1;
-
-  char path[PATH_MAX];
-  if (pid == 0) {
-    if (fd != NULL) {
-      nsfd = *fd;
-      *fd = -1;
-    } else return false;
-
-    snprintf(path, sizeof(path), "/proc/self/fd/%d", nsfd);
-  } else {
-    if (fd != NULL) {
-      old_nsfd = open("/proc/self/ns/mnt", O_RDONLY | O_CLOEXEC);
-      if (old_nsfd == -1) {
-        PLOGE("get old nsfd");
-
-        return false;
-      }
-
-      *fd = old_nsfd;
-    }
-
-    snprintf(path, sizeof(path), "/proc/%d/ns/mnt", pid);
-
-    nsfd = open(path, O_RDONLY | O_CLOEXEC);
-    if (nsfd == -1) {
-      PLOGE("open nsfd %s", path);
-
-      close(old_nsfd);
-
-      return false;
-    }
-  }
-
-  if (setns(nsfd, CLONE_NEWNS) == -1) {
-    PLOGE("set ns to %s", path);
-
-    close(nsfd);
-    close(old_nsfd);
-
-    return false;
-  }
-
-  close(nsfd);
-
-  return true;
-}
-
-struct maps *parse_maps(const char *filename) {
-  FILE *fp = fopen(filename, "r");
-  if (!fp) {
-    LOGE("Failed to open %s", filename);
-
-    return NULL;
-  }
-
-  struct maps *maps = (struct maps *)malloc(sizeof(struct maps));
-  if (!maps) {
-    LOGE("Failed to allocate memory for maps");
-
-    fclose(fp);
-
-    return NULL;
-  }
-
-  /* INFO: To ensure in the realloc the libc will know it is meant
-             to allocate, and not reallocate from a garbage address. */
-  maps->maps = NULL;
-
-  char line[4096 * 2];
-  size_t i = 0;
-
-  while (fgets(line, sizeof(line), fp) != NULL) {
-    line[strcspn(line, "\n")] = '\0';
-
-    uintptr_t addr_start;
-    uintptr_t addr_end;
-    uintptr_t addr_offset;
-    ino_t inode;
-    unsigned int dev_major;
-    unsigned int dev_minor;
-    char permissions[5] = "";
-    int path_offset;
-
-    sscanf(line,
-           "%" PRIxPTR "-%" PRIxPTR " %4s %" PRIxPTR " %x:%x %lu %n%*s",
-           &addr_start, &addr_end, permissions, &addr_offset, &dev_major, &dev_minor,
-           &inode, &path_offset);
-
-    while (isspace(line[path_offset])) {
-      path_offset++;
-    }
-
-    struct map *tmp_maps = (struct map *)realloc(maps->maps, (i + 1) * sizeof(struct map));
-    if (!tmp_maps) {
-      LOGE("Failed to allocate memory for maps->maps");
-
-      maps->size = i;
-
-      fclose(fp);
-      free_maps(maps);
-
-      return NULL;
-    }
-    maps->maps = tmp_maps;
-
-    maps->maps[i].start = addr_start;
-    maps->maps[i].end = addr_end;
-    maps->maps[i].offset = addr_offset;
-
-    maps->maps[i].perms = 0;
-    if (permissions[0] == 'r') maps->maps[i].perms |= PROT_READ;
-    if (permissions[1] == 'w') maps->maps[i].perms |= PROT_WRITE;
-    if (permissions[2] == 'x') maps->maps[i].perms |= PROT_EXEC;
-
-    maps->maps[i].is_private = permissions[3] == 'p';
-    maps->maps[i].dev = makedev(dev_major, dev_minor);
-    maps->maps[i].inode = inode;
-    maps->maps[i].path = strdup(line + path_offset);
-    if (!maps->maps[i].path) {
-      LOGE("Failed to allocate memory for maps->maps[%zu].path", i);
-
-      maps->size = i;
-
-      fclose(fp);
-      free_maps(maps);
-
-      return NULL;
-    }
-
-    i++;
-  }
-
-  fclose(fp);
-
-  maps->size = i;
-
-  return maps;
-}
-
-void free_maps(struct maps *maps) {
-  if (!maps) {
-    return;
-  }
-
-  for (size_t i = 0; i < maps->size; i++) {
-    free((void *)maps->maps[i].path);
-  }
-
-  free(maps->maps);
-  free(maps);
-}
 
 ssize_t write_proc(int pid, uintptr_t remote_addr, const void *buf, size_t len) {
   LOGV("write to remote addr %" PRIxPTR " size %zu", remote_addr, len);
@@ -278,9 +119,9 @@ bool set_regs(int pid, struct user_regs_struct *regs) {
   return true;
 }
 
-void get_addr_mem_region(struct maps *info, uintptr_t addr, char *buf, size_t buf_size) {
-  for (size_t i = 0; i < info->size; i++) {
-    const struct map *m = &info->maps[i];
+void get_addr_mem_region(struct maps_info *info, uintptr_t addr, char *buf, size_t buf_size) {
+  for (size_t i = 0; i < info->length; i++) {
+    const struct map_entry  *m = &info->maps[i];
     if (m->start <= addr && m->end > addr) {
       const char *path = m->path ? m->path : "<anonymous>";
       snprintf(buf, buf_size, "%s %s%s%s",
@@ -302,9 +143,9 @@ const char *position_after(const char *str, const char needle) {
   return positioned ? positioned + 1 : str;
 }
 
-void *find_module_return_addr(struct maps *map, const char *suffix) {
-  for (size_t i = 0; i < map->size; i++) {
-    const struct map *m = &map->maps[i];
+void *find_module_return_addr(struct maps_info *map, const char *suffix) {
+  for (size_t i = 0; i < map->length; i++) {
+    const struct map_entry  *m = &map->maps[i];
     const char *file_name;
 
     if (!m->path || (m->perms & PROT_EXEC)) continue;
@@ -318,9 +159,9 @@ void *find_module_return_addr(struct maps *map, const char *suffix) {
   return NULL;
 }
 
-void *find_module_base(struct maps *map, const char *file) {
-  for (size_t i = 0; i < map->size; i++) {
-    const struct map *m = &map->maps[i];
+void *find_module_base(struct maps_info *map, const char *file) {
+  for (size_t i = 0; i < map->length; i++) {
+    const struct map_entry  *m = &map->maps[i];
     if (!m->path || m->offset != 0) continue;
     if (strcmp(m->path, file) != 0) continue;
 
@@ -330,7 +171,7 @@ void *find_module_base(struct maps *map, const char *file) {
   return NULL;
 }
 
-void *find_func_addr(struct maps *local_info, struct maps *remote_info, const char *module, const char *func) {
+void *find_func_addr(struct maps_info *local_info, struct maps_info *remote_info, const char *module, const char *func) {
   uint8_t *local_base = (uint8_t *)find_module_base(local_info, module);
   if (local_base == NULL) {
     LOGD("failed to find local base for module %s", module);
@@ -401,12 +242,14 @@ uintptr_t remote_call(int pid, struct user_regs_struct *regs, uintptr_t func_add
       long remain = (args_size - 6L) * sizeof(long);
       align_stack(regs, remain);
 
-      if (!write_proc(pid, (uintptr_t) regs->REG_SP, &args[6], remain)) LOGE("failed to push arguments");
+      if (write_proc(pid, (uintptr_t) regs->REG_SP, &args[6], remain) != remain)
+        LOGE("failed to push arguments");
     }
 
     regs->REG_SP -= sizeof(long);
 
-    if (!write_proc(pid, (uintptr_t) regs->REG_SP, &return_addr, sizeof(return_addr))) LOGE("failed to write return addr");
+    if (write_proc(pid, (uintptr_t) regs->REG_SP, &return_addr, sizeof(return_addr)) != sizeof(return_addr))
+      LOGE("failed to write return addr");
 
     regs->REG_IP = func_addr;
   #elif defined(__i386__)
@@ -414,12 +257,14 @@ uintptr_t remote_call(int pid, struct user_regs_struct *regs, uintptr_t func_add
       long remain = (args_size) * sizeof(long);
       align_stack(regs, remain);
 
-      if (!write_proc(pid, (uintptr_t) regs->REG_SP, args, remain)) LOGE("failed to push arguments");
+      if (write_proc(pid, (uintptr_t) regs->REG_SP, args, remain) != remain)
+        LOGE("failed to push arguments");
     }
 
     regs->REG_SP -= sizeof(long);
 
-    if (!write_proc(pid, (uintptr_t) regs->REG_SP, &return_addr, sizeof(return_addr))) LOGE("failed to write return addr");
+    if (write_proc(pid, (uintptr_t) regs->REG_SP, &return_addr, sizeof(return_addr)) != sizeof(return_addr))
+      LOGE("failed to write return addr");
 
     regs->REG_IP = func_addr;
   #elif defined(__aarch64__)
@@ -511,7 +356,7 @@ int fork_dont_care() {
   return pid;
 }
 
-uintptr_t find_syscall_gadget(int pid, struct maps *remote_map) {
+uintptr_t find_syscall_gadget(int pid, struct maps_info *remote_map) {
   /* INFO: Find a syscall instruction (svc #0 on aarch64, svc 0 on arm32,
            syscall on x86_64, int 0x80 on i386) in executable memory.
            We search vdso first as it's always present. */
@@ -521,10 +366,8 @@ uintptr_t find_syscall_gadget(int pid, struct maps *remote_map) {
     const size_t insn_size = 4;
     const uintptr_t insn_bias = 0;
   #elif defined(__arm__)
-    /* ARM Thumb: 0xDF00 (svc 0) or ARM: 0xEF000000 (svc 0) */
-    const uint32_t svc_insn = 0xDF00;
-    const size_t insn_size = 2;
-    const uintptr_t insn_bias = 1;
+    const uint16_t thumb_svc_insn = 0xDF00;
+    const uint32_t arm_svc_insn = 0xEF000000;
   #elif defined(__x86_64__)
     const uint16_t svc_insn = 0x050F; /* syscall */
     const size_t insn_size = 2;
@@ -538,8 +381,8 @@ uintptr_t find_syscall_gadget(int pid, struct maps *remote_map) {
   for (int pass = 0; pass < 2; pass++) {
     bool vdso_only = pass == 0;
 
-    for (size_t i = 0; i < remote_map->size; i++) {
-      const struct map *m = &remote_map->maps[i];
+    for (size_t i = 0; i < remote_map->length; i++) {
+      const struct map_entry  *m = &remote_map->maps[i];
       bool is_vdso = m->path && strstr(m->path, "[vdso]") != NULL;
       size_t region_size = m->end - m->start;
 
@@ -557,17 +400,43 @@ uintptr_t find_syscall_gadget(int pid, struct maps *remote_map) {
         continue;
       }
 
-      for (size_t j = 0; j + insn_size <= region_size; j += insn_size) {
-        if (memcmp(buf + j, &svc_insn, insn_size) != 0) continue;
+      /* INFO: The binary, in ARM32, might contain either ARM or Thumb instructions
+                 depending of how it was compiled. So, for safety, we included both
+                 as possibilities for the syscall gadget. Thumb instruction set is
+                 different, so take it in consideration too. */
+      #ifdef __arm__
+        for (size_t j = 0; j + sizeof(arm_svc_insn) <= region_size; j += sizeof(uint32_t)) {
+          if (memcmp(buf + j, &arm_svc_insn, sizeof(arm_svc_insn)) != 0) continue;
 
-        uintptr_t addr = m->start + j + insn_bias;
+          LOGD("found ARM syscall gadget in %s at offset 0x%zx", vdso_only ? "vdso" : (m->path ? m->path : "<anon>"), j);
 
-        LOGD("found syscall gadget in %s at offset 0x%zx", vdso_only ? "vdso" : (m->path ? m->path : "<anon>"), j);
+          free(buf);
 
-        free(buf);
+          return m->start + j;
+        }
 
-        return addr;
-      }
+        for (size_t j = 0; j + sizeof(thumb_svc_insn) <= region_size; j += sizeof(uint16_t)) {
+          if (memcmp(buf + j, &thumb_svc_insn, sizeof(thumb_svc_insn)) != 0) continue;
+
+          LOGD("found Thumb syscall gadget in %s at offset 0x%zx", vdso_only ? "vdso" : (m->path ? m->path : "<anon>"), j);
+
+          free(buf);
+
+          return m->start + j + 1;
+        }
+      #else
+        for (size_t j = 0; j + insn_size <= region_size; j += insn_size) {
+          if (memcmp(buf + j, &svc_insn, insn_size) != 0) continue;
+
+          uintptr_t addr = m->start + j + insn_bias;
+
+          LOGD("found syscall gadget in %s at offset 0x%zx", vdso_only ? "vdso" : (m->path ? m->path : "<anon>"), j);
+
+          free(buf);
+
+          return addr;
+        }
+      #endif
 
       free(buf);
     }
@@ -578,22 +447,9 @@ uintptr_t find_syscall_gadget(int pid, struct maps *remote_map) {
   return 0;
 }
 
-#ifdef __aarch64__
 
-bool tango_step_to_syscall(int pid) {
-  while (true) {
-    int status;
-    wait_for_trace(pid, &status, __WALL);
-
-    if (!WIFSTOPPED(status)) return false;
-    if (WSTOPSIG(status) == (SIGTRAP | 0x80)) return true;
-
-    ptrace(PTRACE_SYSCALL, pid, 0, (status >> 16) ? 0 : WSTOPSIG(status));
-  }
-}
-
-bool tango_drain_to_event_stop(int pid) {
-  while (true) {
+bool wait_for_event_stop(int pid) {
+  while (1) {
     int status;
     wait_for_trace(pid, &status, __WALL);
 
@@ -602,68 +458,249 @@ bool tango_drain_to_event_stop(int pid) {
 
     if (!WIFSTOPPED(status)) return false;
 
-    ptrace(PTRACE_CONT, pid, 0, (status >> 16) ? 0 : WSTOPSIG(status));
+    if (ptrace(PTRACE_CONT, pid, 0, (status >> 16) ? 0 : WSTOPSIG(status)) == -1) {
+      PLOGE("PTRACE_CONT while draining to EVENT_STOP");
+
+      return false;
+    }
   }
 }
 
-static bool tango_init_linker_watch(int pid, struct maps *remote_map, struct tango_linker_watch *watch) {
-  memset(watch, 0, sizeof(*watch));
+#ifndef R_ARM_JUMP_SLOT
+  #define R_ARM_JUMP_SLOT 22
+#endif
 
-  for (size_t i = 0; i < remote_map->size; i++) {
-    const struct map *m = &remote_map->maps[i];
-    if (!m->path || (uintptr_t)m->start >= 0x100000000ULL || m->offset != 0 || !strstr(m->path, "app_process32")) continue;
+static bool elf32_vaddr_to_off(const Elf32_Phdr *phdr, int phnum, Elf32_Addr vaddr, off_t *out_off) {
+  for (int i = 0; i < phnum; i++) {
+    if (phdr[i].p_type != PT_LOAD) continue;
 
-    struct elf_32 *img = elf_32_create(m->path);
-    if (!img) {
-      LOGD("Failed to parse ELF '%s'", m->path);
+    Elf32_Addr seg_start = phdr[i].p_vaddr;
+    Elf32_Addr seg_end = phdr[i].p_vaddr + phdr[i].p_filesz;
+    if (vaddr < seg_start || vaddr >= seg_end) continue;
 
-      return false;
-    }
+    *out_off = (off_t)phdr[i].p_offset + (off_t)(vaddr - seg_start);
 
-    uint32_t load_bias = (uint32_t)(uintptr_t)m->start - (uint32_t)img->bias;
-    Elf32_Addr got_off = elf_32_find_plt_got_offset(img, "__libc_init");
-
-    elf_32_destroy(img);
-
-    if (!got_off) {
-      LOGD("Failed to find __libc_init in JMPREL of '%s'", m->path);
-
-      return false;
-    }
-
-    watch->libc_init_got_slot = got_off + load_bias;
-
-    break;
+    return true;
   }
 
-  if (!watch->libc_init_got_slot) return false;
+  return false;
+}
 
-  if (read_proc(pid, (uintptr_t)watch->libc_init_got_slot, &watch->libc_init_initial, 4) != 4) {
-    LOGD("Failed to read __libc_init GOT@0x%x", watch->libc_init_got_slot);
-
-    memset(watch, 0, sizeof(*watch));
+static bool find_jump_slot_got_offset_elf32(const char *elf_path, const char *symbol, uint32_t *out_bias, uint32_t *out_got_off) {
+  int fd = open(elf_path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    PLOGE("open ELF32 %s", elf_path);
 
     return false;
   }
 
-  return true;
+  struct stat st;
+  if (fstat(fd, &st) != 0 || st.st_size < (off_t)sizeof(Elf32_Ehdr)) {
+    LOGE("Failed to stat ELF32 %s", elf_path);
+
+    close(fd);
+
+    return false;
+  }
+
+  Elf32_Ehdr eh;
+  if (pread(fd, &eh, sizeof(eh), 0) != (ssize_t)sizeof(eh)) {
+    LOGE("Failed to read ELF32 header");
+
+    close(fd);
+
+    return false;
+  }
+
+  if (memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0 || eh.e_ident[EI_CLASS] != ELFCLASS32 || eh.e_phnum == 0) {
+    LOGE("Invalid ELF32 header in %s", elf_path);
+
+    close(fd);
+
+    return false;
+  }
+
+  Elf32_Phdr *phdr = calloc(eh.e_phnum, sizeof(Elf32_Phdr));
+  if (!phdr) {
+    LOGE("Failed to allocate memory for program headers");
+
+    close(fd);
+
+    return false;
+  }
+
+  if (pread(fd, phdr, sizeof(Elf32_Phdr) * eh.e_phnum, eh.e_phoff) != (ssize_t)(sizeof(Elf32_Phdr) * eh.e_phnum)) {
+    LOGE("Failed to read program headers");
+
+    free(phdr);
+    close(fd);
+
+    return false;
+  }
+
+  Elf32_Addr min_vaddr = UINT32_MAX;
+  Elf32_Addr dyn_vaddr = 0;
+  Elf32_Word dyn_size = 0;
+  for (int i = 0; i < eh.e_phnum; i++) {
+    if (phdr[i].p_type == PT_LOAD && phdr[i].p_vaddr < min_vaddr) min_vaddr = phdr[i].p_vaddr;
+    if (phdr[i].p_type == PT_DYNAMIC) {
+      dyn_vaddr = phdr[i].p_vaddr;
+      dyn_size = phdr[i].p_filesz;
+    }
+  }
+
+  if (!dyn_vaddr || !dyn_size || min_vaddr == UINT32_MAX) {
+    free(phdr);
+    close(fd);
+
+    return false;
+  }
+
+  off_t dyn_off = 0;
+  if (!elf32_vaddr_to_off(phdr, eh.e_phnum, dyn_vaddr, &dyn_off)) {
+    free(phdr);
+    close(fd);
+
+    return false;
+  }
+
+  size_t dyn_count = dyn_size / sizeof(Elf32_Dyn);
+  Elf32_Dyn *dyn = calloc(dyn_count, sizeof(Elf32_Dyn));
+  if (!dyn) {
+    free(phdr);
+    close(fd);
+
+    return false;
+  }
+
+  if (pread(fd, dyn, dyn_count * sizeof(Elf32_Dyn), dyn_off) != (ssize_t)(dyn_count * sizeof(Elf32_Dyn))) {
+    free(dyn);
+    free(phdr);
+    close(fd);
+
+    return false;
+  }
+
+  Elf32_Addr jmprel = 0, symtab = 0, strtab = 0;
+  Elf32_Word pltrelsz = 0, pltrel = 0;
+  for (size_t i = 0; i < dyn_count; i++) {
+    switch (dyn[i].d_tag) {
+      case DT_JMPREL: jmprel = dyn[i].d_un.d_ptr; break;
+      case DT_PLTRELSZ: pltrelsz = dyn[i].d_un.d_val; break;
+      case DT_PLTREL: pltrel = dyn[i].d_un.d_val; break;
+      case DT_SYMTAB: symtab = dyn[i].d_un.d_ptr; break;
+      case DT_STRTAB: strtab = dyn[i].d_un.d_ptr; break;
+      default: break;
+    }
+  }
+
+  if (!jmprel || !pltrelsz || !symtab || !strtab || !(pltrel == DT_REL || pltrel == DT_RELA)) {
+    LOGE("Failed to find necessary dynamic entries in %s", elf_path);
+
+    free(dyn);
+    free(phdr);
+    close(fd);
+
+    return false;
+  }
+
+  off_t rel_off = 0, sym_off = 0, str_off = 0;
+  if (!elf32_vaddr_to_off(phdr, eh.e_phnum, jmprel, &rel_off) ||
+      !elf32_vaddr_to_off(phdr, eh.e_phnum, symtab, &sym_off) ||
+      !elf32_vaddr_to_off(phdr, eh.e_phnum, strtab, &str_off)
+  ) {
+    LOGE("Failed to convert necessary virtual addresses to file offsets in %s", elf_path);
+
+    free(dyn);
+    free(phdr);
+    close(fd);
+
+    return false;
+  }
+
+  bool found = false;
+  size_t entsz = (pltrel == DT_REL) ? sizeof(Elf32_Rel) : sizeof(Elf32_Rela);
+  size_t count = pltrelsz / entsz;
+  for (size_t i = 0; i < count; i++) {
+    Elf32_Addr r_offset = 0;
+    Elf32_Word r_info = 0;
+
+    if (pltrel == DT_REL) {
+      Elf32_Rel rel;
+      if (pread(fd, &rel, sizeof(rel), rel_off + (off_t)(i * sizeof(rel))) != (ssize_t)sizeof(rel)) break;
+
+      r_offset = rel.r_offset;
+      r_info = rel.r_info;
+    } else {
+      Elf32_Rela rela;
+      if (pread(fd, &rela, sizeof(rela), rel_off + (off_t)(i * sizeof(rela))) != (ssize_t)sizeof(rela)) break;
+
+      r_offset = rela.r_offset;
+      r_info = rela.r_info;
+    }
+
+    if (ELF32_R_TYPE(r_info) != R_ARM_JUMP_SLOT) continue;
+    Elf32_Word sym_index = ELF32_R_SYM(r_info);
+
+    Elf32_Sym sym;
+    if (pread(fd, &sym, sizeof(sym), sym_off + (off_t)(sym_index * sizeof(sym))) != (ssize_t)sizeof(sym)) continue;
+    if (sym.st_name == 0) continue;
+
+    char name[128] = { 0 };
+    if (pread(fd, name, sizeof(name) - 1, str_off + (off_t)sym.st_name) <= 0) continue;
+    if (strcmp(name, symbol) != 0) continue;
+
+    *out_bias = min_vaddr;
+    *out_got_off = r_offset;
+    found = true;
+
+    break;
+  }
+
+  free(dyn);
+  free(phdr);
+  close(fd);
+
+  return found;
 }
 
-bool tango_wait_linker_ready(int pid, struct tango_linker_watch *watch) {
-  while (true) {
-    if (!watch->libc_init_got_slot) {
-      char maps_path[64];
-      snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
 
-      struct maps *remote_map = parse_maps(maps_path);
+bool tango_wait_linker_ready(int pid, struct tango_linker_watch *watch) {
+  while (1) {
+    if (!watch->libc_init_got_slot) {
+      /* INFO: The character limit for a 32-bit integer is 10 */
+      char pid_str[10 + 1];
+      snprintf(pid_str, sizeof(pid_str), "%d", pid);
+
+      struct maps_info *remote_map = parse_maps(pid_str);
       if (!remote_map) {
         LOGE("Failed to parse remote maps for pid %d", pid);
 
         return false;
       }
 
-      if (tango_init_linker_watch(pid, remote_map, watch)) {
+      memset(watch, 0, sizeof(*watch));
+      for (size_t i = 0; i < remote_map->length; i++) {
+        const struct map_entry  *m = &remote_map->maps[i];
+        if (!m->path || (uintptr_t)m->start >= 0x100000000ULL || m->offset != 0 || !strstr(m->path, "app_process32")) continue;
+
+        uint32_t bias = 0, got_off = 0;
+        if (!find_jump_slot_got_offset_elf32(m->path, "__libc_init", &bias, &got_off)) {
+          LOGD("Failed to find __libc_init in JMPREL of '%s'", m->path);
+
+          continue;
+        }
+
+        watch->libc_init_got_slot = ((uint32_t)(uintptr_t)m->start - bias) + got_off;
+
+        break;
+      }
+
+      if (watch->libc_init_got_slot && read_proc(pid, (uintptr_t)watch->libc_init_got_slot, &watch->libc_init_initial, 4) == 4) {
         LOGI("Found __libc_init GOT@0x%x (initial=0x%x), waiting for linker", watch->libc_init_got_slot, watch->libc_init_initial);
+      } else if (watch->libc_init_got_slot) {
+        LOGD("Failed to read __libc_init GOT@0x%x", watch->libc_init_got_slot);
+        memset(watch, 0, sizeof(*watch));
       }
 
       free_maps(remote_map);
@@ -684,7 +721,8 @@ bool tango_wait_linker_ready(int pid, struct tango_linker_watch *watch) {
       return false;
     }
 
-    if (!tango_step_to_syscall(pid)) {
+    int status = 0;
+    if (!wait_for_ptrace_syscall_stop(pid, &status)) {
       LOGE("Process %d died while waiting for injection point", pid);
 
       return false;
@@ -725,8 +763,9 @@ uint32_t find_tramp_padding(int pid, uint32_t rx_start, uint32_t rx_end, size_t 
 
 /* INFO: This allows to bypass RELRO memory protection */
 bool ptrace_poke_u32(pid_t pid, uintptr_t addr, uint32_t value) {
-  uintptr_t aligned = addr & ~(uintptr_t)7;
-  uintptr_t shift = (addr & (uintptr_t)7) * 8;
+  uintptr_t word_mask = (uintptr_t)(sizeof(unsigned long) - 1);
+  uintptr_t aligned = addr & ~word_mask;
+  uintptr_t shift = (addr & word_mask) * 8;
 
   errno = 0;
   unsigned long data = (unsigned long)ptrace(PTRACE_PEEKDATA, pid, (void *)aligned, 0);
@@ -736,8 +775,9 @@ bool ptrace_poke_u32(pid_t pid, uintptr_t addr, uint32_t value) {
     return false;
   }
 
-  unsigned long masked = data & ~((unsigned long)0xFFFFFFFFu << shift);
-  unsigned long patched = masked | ((unsigned long)value << shift);
+  uint64_t lane_mask64 = (uint64_t)0xFFFFFFFFu << shift;
+  unsigned long masked = data & (unsigned long)~lane_mask64;
+  unsigned long patched = masked | (unsigned long)((uint64_t)value << shift);
   if (ptrace(PTRACE_POKEDATA, pid, (void *)aligned, (void *)patched) == -1) {
     PLOGE("ptrace pokedata at 0x%" PRIxPTR, addr);
 
@@ -747,11 +787,11 @@ bool ptrace_poke_u32(pid_t pid, uintptr_t addr, uint32_t value) {
   return true;
 }
 
-uintptr_t find_arm32_ret_gadget(int pid, struct maps *remote_map) {
+uintptr_t find_arm32_ret_gadget(int pid, struct maps_info *remote_map) {
   const uint16_t bx_lr = 0x4770;
 
-  for (size_t i = 0; i < remote_map->size; i++) {
-    const struct map *m = &remote_map->maps[i];
+  for (size_t i = 0; i < remote_map->length; i++) {
+    const struct map_entry  *m = &remote_map->maps[i];
     if (!(m->perms & PROT_EXEC)) continue;
     if ((uintptr_t)m->start >= 0x100000000ULL) continue;
 
@@ -786,11 +826,81 @@ uintptr_t find_arm32_ret_gadget(int pid, struct maps *remote_map) {
 
   return 0;
 }
-#endif /* __aarch64__ */
+
+#ifdef __aarch64__
+  #define AARCH64_PSTATE_BTYPE_MASK (3ull << 10)
+#endif
+
+bool wait_for_ptrace_syscall_stop(int pid, int *status) {
+  int step_retries = 0;
+  while (1) {
+    pid_t waited = waitpid(pid, status, __WALL);
+    if (waited == -1) {
+      if (errno == EINTR) continue;
+
+      PLOGE("waitpid");
+
+      return false;
+    }
+
+    if (waited != pid) continue;
+
+    if (!WIFSTOPPED(*status)) {
+      char status_str[64];
+      parse_status(*status, status_str, sizeof(status_str));
+      LOGE("Remote syscall stop is not ptrace-stop: %s", status_str);
+
+      return false;
+    }
+
+    int stop_sig = WSTOPSIG(*status);
+    int stop_event = (*status >> 16) & 0xff;
+    bool is_syscall_stop = stop_event == 0 && (stop_sig == SIGTRAP || stop_sig == (SIGTRAP | 0x80));
+
+    if ((stop_sig == SIGSTOP || stop_sig == SIGTRAP) && stop_event == PTRACE_EVENT_STOP) {
+      if (step_retries++ >= 4) {
+        char status_str[64];
+        parse_status(*status, status_str, sizeof(status_str));
+        LOGE("Remote syscall stuck in ptrace-stop: %s", status_str);
+
+        return false;
+      }
+
+      LOGV("Remote syscall got pending ptrace-stop, retrying (retry %d)", step_retries);
+
+      if (ptrace(PTRACE_SYSCALL, pid, 0, 0) == -1) {
+        PLOGE("PTRACE_SYSCALL retry");
+
+        return false;
+      }
+
+      continue;
+    }
+
+    if (is_syscall_stop) return true;
+
+    char status_str[64];
+    parse_status(*status, status_str, sizeof(status_str));
+    LOGE("Remote syscall unexpected stop: %s", status_str);
+
+    return false;
+  }
+}
 
 long remote_syscall(int pid, struct user_regs_struct *regs, uintptr_t syscall_gadget, long sysnr, long *args, size_t args_size) {
-  LOGV("remote syscall %ld args %zu at gadget %p", sysnr, args_size, (void *)syscall_gadget);
+  LOGV("Remote syscall %ld args %zu at gadget %p", sysnr, args_size, (void *)syscall_gadget);
 
+  long ret = -1;
+
+  /* Save tracee's current register state (all architectures) */
+  struct user_regs_struct saved_regs;
+  if (!get_regs(pid, &saved_regs)) {
+    LOGE("Failed to get regs for save");
+
+    return -1;
+  }
+
+  /* Use *regs as scratch for syscall setup */
   #if defined(__aarch64__)
     /* x8 = syscall number, x0-x5 = args */
     regs->regs[8] = sysnr;
@@ -801,6 +911,8 @@ long remote_syscall(int pid, struct user_regs_struct *regs, uintptr_t syscall_ga
       regs->regs[i] = args[i];
     }
     regs->REG_IP = syscall_gadget;
+    /* INFO: BTYPE so stepping the aarch64 vDSO svc will be accepted by the CPU */
+    regs->pstate &= ~AARCH64_PSTATE_BTYPE_MASK;
   #elif defined(__arm__)
     /* r7 = syscall number, r0-r5 = args */
     regs->uregs[7] = sysnr;
@@ -823,6 +935,7 @@ long remote_syscall(int pid, struct user_regs_struct *regs, uintptr_t syscall_ga
   #elif defined(__x86_64__)
     /* rax = syscall number, rdi,rsi,rdx,r10,r8,r9 = args */
     regs->REG_SYSNR = sysnr;
+    regs->rax = sysnr;
     regs->rdi = 0;
     regs->rsi = 0;
     regs->rdx = 0;
@@ -840,6 +953,7 @@ long remote_syscall(int pid, struct user_regs_struct *regs, uintptr_t syscall_ga
   #elif defined(__i386__)
     /* eax = syscall number, ebx,ecx,edx,esi,edi,ebp = args */
     regs->REG_SYSNR = sysnr;
+    regs->eax = sysnr;
     regs->ebx = 0;
     regs->ecx = 0;
     regs->edx = 0;
@@ -857,77 +971,44 @@ long remote_syscall(int pid, struct user_regs_struct *regs, uintptr_t syscall_ga
   #endif
 
   if (!set_regs(pid, regs)) {
-    LOGE("failed to set regs for syscall");
+    LOGE("Failed to set regs for syscall");
 
-    return -1;
+    goto restore_regs;
   }
 
-  /* INFO: Single-step through the syscall instruction */
-  if (ptrace(PTRACE_SINGLESTEP, pid, 0, 0) == -1) {
-    PLOGE("PTRACE_SINGLESTEP");
+  /* INFO: We must perform this code twice. The first time is to step into the syscall entry,
+             and the second time is to step out of the syscall exit. */
+  for (int i = 0; i < 2; i++) {
+    if (ptrace(PTRACE_SYSCALL, pid, 0, 0) == -1) {
+      PLOGE("PTRACE_SYSCALL");
 
-    return -1;
-  }
-
-  int status = 0;
-  int step_retries = 0;
-  while (1) {
-    pid_t waited = waitpid(pid, &status, __WALL);
-    if (waited == -1) {
-      if (errno == EINTR) continue;
-      PLOGE("waitpid after PTRACE_SINGLESTEP");
-
-      return -1;
-    }
-    if (waited != pid) continue;
-
-    if (!WIFSTOPPED(status)) {
-      char status_str[64];
-      parse_status(status, status_str, sizeof(status_str));
-      LOGE("remote syscall stop is not ptrace-stop: %s", status_str);
-
-      return -1;
+      ret = -1;
+      goto restore_regs;
     }
 
-    int stop_sig = WSTOPSIG(status);
-    int stop_event = (status >> 16) & 0xff;
+    int status;
+    if (!wait_for_ptrace_syscall_stop(pid, &status)) goto restore_regs;
 
-    if ((stop_sig == SIGSTOP || stop_sig == SIGTRAP) && stop_event == PTRACE_EVENT_STOP) {
-      if (step_retries++ >= 4) {
-        char status_str[64];
-        parse_status(status, status_str, sizeof(status_str));
-        LOGE("remote syscall stuck in ptrace-stop: %s", status_str);
-
-        return -1;
-      }
-
-      LOGV("remote syscall got pending ptrace-stop, re-single-step (retry %d)", step_retries);
-
-      if (ptrace(PTRACE_SINGLESTEP, pid, 0, 0) == -1) {
-        PLOGE("PTRACE_SINGLESTEP retry");
-
-        return -1;
-      }
-
-      continue;
-    }
-
-    if (stop_sig == SIGTRAP && stop_event == 0) break;
-
-    char status_str[64];
-    parse_status(status, status_str, sizeof(status_str));
-    LOGE("remote syscall unexpected stop: %s", status_str);
-
-    return -1;
+    if (i == 0)
+      LOGV("Remote syscall %ld got PTRACE_SYSCALL entry-stop, continuing to exit-stop", sysnr);
   }
 
   if (!get_regs(pid, regs)) {
-    LOGE("failed to get regs after syscall");
+    LOGE("Failed to get regs after PTRACE_SYSCALL");
 
-    return -1;
+    ret = -1;
+    goto restore_regs;
   }
 
-  return (long)regs->REG_RET;
+  ret = (long)regs->REG_RET;
+
+  LOGV("Remote syscall %ld succeeded: %ld", sysnr, ret);
+
+  restore_regs:
+    *regs = saved_regs;
+    if (!set_regs(pid, regs)) LOGE("Failed to restore regs after syscall");
+
+    return ret;
 }
 
 void tracee_skip_syscall(int pid) {
@@ -1022,15 +1103,19 @@ int get_program(int pid, char *buf, size_t size) {
   snprintf(path, sizeof(path), "/proc/%d/exe", pid);
 
   ssize_t sz = readlink(path, buf, size);
-
   if (sz == -1) {
     PLOGE("readlink /proc/%d/exe", pid);
 
     return -1;
   }
 
+  if ((size_t)sz >= size) {
+    LOGW("Program path truncated (%zd >= %zu)", sz, size);
+
+    sz = size - 1;
+  }
+
   buf[sz] = '\0';
 
   return 0;
 }
-

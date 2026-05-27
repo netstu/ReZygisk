@@ -1,19 +1,16 @@
 #include <stdlib.h>
-#include <stdint.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
+
 #include <fcntl.h>
+#include <sys/auxv.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <sys/auxv.h>
 
 #include <unistd.h>
 
-#ifdef __LP64__
-  #define LOG_TAG "zygisk-elfutil64"
-#else
-  #define LOG_TAG "zygisk-elfutil32"
-#endif
+#define LOG_TAG "zygisk-elfutil" LP_SELECT("32", "64")
 
 #include "logging.h"
 
@@ -96,22 +93,24 @@ size_t calculate_valid_symtabs_amount(ElfImg *img) {
     return 0;
   }
 
-  char *symtab_strings = offsetOf_char(img->header, img->symstr_offset_for_symtab);
+  ElfW(Shdr) *symtab_str_shdr = NULL;
+  if (img->symtab && img->section_header && img->symtab->sh_link < img->header->e_shnum)
+    symtab_str_shdr = img->section_header + img->symtab->sh_link;
 
   for (ElfW(Off) i = 0; i < img->symtab_count; i++) {
-    const char *sym_name = symtab_strings + img->symtab_start[i].st_name;
-    if (!sym_name)
+    if (symtab_str_shdr && img->symtab_start[i].st_name >= symtab_str_shdr->sh_size) {
+      LOGW("Symbol %zu has invalid name offset %u (>= %zu), skipping", (size_t)i, img->symtab_start[i].st_name, (size_t)symtab_str_shdr->sh_size);
+
       continue;
+    }
 
     unsigned int st_type = ELF_ST_TYPE(img->symtab_start[i].st_info);
-
     if ((st_type == STT_FUNC || st_type == STT_OBJECT) && img->symtab_start[i].st_size > 0 && img->symtab_start[i].st_name != 0)
       count++;
   }
 
   return count;
 }
-
 
 void ElfImg_destroy(ElfImg *img) {
   if (!img) return;
@@ -364,8 +363,6 @@ ElfImg *ElfImg_create(const char *elf, void *base) {
     } else {
       LOGE(".dynsym sh_link (%u) is out of bounds (%u)", dynsym_shdr->sh_link, img->header->e_shnum);
     }
-  } else {
-    LOGW("No .dynsym section found or section headers missing");
   }
 
   if (symtab_shdr && shdr_base) {
@@ -388,8 +385,6 @@ ElfImg *ElfImg_create(const char *elf, void *base) {
       img->symstr_offset_for_symtab = 0;
     }
   } else {
-    LOGD("No .symtab section found or section headers missing");
-
     img->symtab_start = NULL;
     img->symtab_count = 0;
     img->symstr_offset_for_symtab = 0;
@@ -440,11 +435,7 @@ ElfImg *ElfImg_create(const char *elf, void *base) {
 bool _load_symtabs(ElfImg *img) {
   if (img->symtabs_) return true;
 
-  if (!img->symtab_start || img->symstr_offset_for_symtab == 0 || img->symtab_count == 0) {
-    LOGE("Cannot load symtabs: .symtab section or its string table not found/valid.");
-
-    return false;
-  }
+  if (!img->symtab_start || img->symstr_offset_for_symtab == 0 || img->symtab_count == 0) return false;
 
   size_t valid_symtabs_amount = calculate_valid_symtabs_amount(img);
   if (valid_symtabs_amount == 0) {
@@ -605,11 +596,7 @@ ElfW(Addr) ElfLookup(ElfImg *restrict img, const char *restrict name, uint32_t h
 }
 
 ElfW(Addr) LinearLookup(ElfImg *img, const char *restrict name, unsigned char *sym_type) {
-  if (!_load_symtabs(img)) {
-    LOGE("Failed to load symtabs for linear lookup of %s", name);
-
-    return 0;
-  }
+  if (!_load_symtabs(img)) return 0;
 
   size_t valid_symtabs_amount = calculate_valid_symtabs_amount(img);
   if (valid_symtabs_amount == 0) {
@@ -635,11 +622,7 @@ ElfW(Addr) LinearLookup(ElfImg *img, const char *restrict name, unsigned char *s
 }
 
 ElfW(Addr) LinearLookupByPrefix(ElfImg *img, const char *prefix, unsigned char *sym_type) {
-  if (!_load_symtabs(img)) {
-    LOGE("Failed to load symtabs for linear lookup by prefix of %s", prefix);
-
-    return 0;
-  }
+  if (!_load_symtabs(img)) return 0;
 
   size_t valid_symtabs_amount = calculate_valid_symtabs_amount(img);
   if (valid_symtabs_amount == 0) {
@@ -756,7 +739,7 @@ ElfW(Addr) getSymbOffset(ElfImg *img, const char *name, unsigned char *sym_type)
          This function is based on AOSP's (Android Open Source Project) code, and resolves the
            indirect symbol, leading to the correct, most appropriate for the hardware, symbol.
 
-    SOURCES: 
+    SOURCES:
      - https://android.googlesource.com/platform/bionic/+/refs/tags/android-16.0.0_r1/linker/linker.cpp#2594
      - https://android.googlesource.com/platform/bionic/+/tags/android-16.0.0_r1/libc/bionic/bionic_call_ifunc_resolver.cpp#41
 */

@@ -223,8 +223,6 @@ server_samsung_q = ForkServer('samsung_q', [uid, gid, gids, runtime_flags, Anon(
     permitted_capabilities, effective_capabilities])
 
 # GrapheneOS Android 14 Support
-server_grapheneos_u = ForkServer('grapheneos_u', [uid, gid, gids, runtime_flags, rlimits, permitted_capabilities, effective_capabilities])
-
 fas_grapheneos_u = ForkAndSpec('grapheneos_u', [uid, gid, gids, runtime_flags, rlimits, mount_external,
     se_info, nice_name, fds_to_close, fds_to_ignore, is_child_zygote, instruction_set, app_data_dir,
     is_top_app, pkg_data_info_list, whitelisted_data_info_list, mount_data_dirs, mount_storage_dirs, mount_sysprop_overrides, Anon(jlongArray)])
@@ -240,13 +238,13 @@ def gen_jni_def(clz, methods):
         hook_map[clz] = []
 
     decl = ''
-    
+
     # Generate function pointer typedef for original function
     func_ptr_type = f'{methods[0].base_name()}_fn'
     # Use the first method's signature as the base (they differ only in args count)
     first_m = methods[0]
     decl += ind(0) + f'typedef {first_m.ret.type.cpp} (*{func_ptr_type})(JNIEnv *, jclass, ...);'
-    
+
     for m in methods:
         decl += ind(0) + f'__attribute__((no_stack_protector)) static {m.ret.type.cpp} {m.name}(JNIEnv *env, jclass clazz, {m.cpp()}) {{'
         decl += m.body()
@@ -284,7 +282,7 @@ with open('jni_hooks.h', 'w') as f:
     methods = [spec_q, spec_q_alt, spec_r, spec_u, spec_samsung_q, spec_grapheneos_u]
     f.write(gen_jni_def(zygote, methods))
 
-    methods = [server_l, server_samsung_q, server_grapheneos_u]
+    methods = [server_l, server_samsung_q]
     f.write(gen_jni_def(zygote, methods))
 
     f.write("""

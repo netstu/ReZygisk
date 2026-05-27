@@ -1,12 +1,11 @@
 #include <sys/types.h>
-#include <sys/stat.h>
-
-#include "../utils.h"
-#include "kernelsu.h"
-#include "apatch.h"
-#include "magisk.h"
 
 #include "common.h"
+
+#include "../utils.h"
+#include "apatch.h"
+#include "kernelsu.h"
+#include "magisk.h"
 
 static struct root_impl impl;
 
@@ -58,11 +57,7 @@ void root_impls_setup(void) {
       break;
     }
     case Magisk: {
-      if (state_magisk.variant == 0) {
-        LOGI("Magisk Official root implementation found.\n");
-      } else {
-        LOGI("Magisk Kitsune root implementation found.\n");
-      }
+      LOGI("Magisk root implementation found.\n");
 
       break;
     }

@@ -1,18 +1,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
-#include <sys/socket.h>
+#include <string.h>
+#include <errno.h>
 
 #include <linux/un.h>
+#include <sys/socket.h>
 
 #include "logging.h"
+#include "misc.h"
 #include "socket_utils.h"
 
 #include "daemon.h"
 
-int rezygiskd_connect(uint8_t retry) {
-  retry++;
+#define SOCKET_FILE_NAME LP_SELECT("cp32", "cp64") ".sock"
 
+int rezygiskd_connect(uint8_t retry) {
   const char *sock_path = TMP_PATH "/" SOCKET_FILE_NAME;
 
   struct sockaddr_un addr = {
@@ -20,7 +23,7 @@ int rezygiskd_connect(uint8_t retry) {
     .sun_path = { 0 }
   };
 
-  /* 
+  /*
     INFO: Application must assume that sun_path can hold _POSIX_PATH_MAX characters.
 
     Sources:
@@ -29,6 +32,7 @@ int rezygiskd_connect(uint8_t retry) {
   strcpy(addr.sun_path, sock_path);
   socklen_t socklen = sizeof(addr);
 
+  retry++;
   while (--retry) {
     int fd = socket(PF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd == -1) {
@@ -43,7 +47,7 @@ int rezygiskd_connect(uint8_t retry) {
     close(fd);
 
     if (retry) {
-      PLOGE("Retrying to connect to ReZygiskd, sleep 1s");
+      PLOGE("Failed to connect to ReZygiskd, retrying...");
 
       sleep(1);
     }
@@ -51,6 +55,25 @@ int rezygiskd_connect(uint8_t retry) {
 
   return -1;
 }
+
+/* TODO: We should unify all of those */
+#define safe_write(fn, name, ret_type)             \
+  if (fn == -1) {                                  \
+    LOGE("Failed to write " name " to ReZygiskd"); \
+                                                   \
+    close(fd);                                     \
+                                                   \
+    ret_type;                                      \
+  }
+
+#define safe_read(fn, name, ret_type)               \
+  if (fn == -1) {                                   \
+    LOGE("Failed to read " name " from ReZygiskd"); \
+                                                    \
+    close(fd);                                      \
+                                                    \
+    ret_type;                                       \
+  }
 
 bool rezygiskd_zygote_injected() {
   int fd = rezygiskd_connect(5);
@@ -60,7 +83,7 @@ bool rezygiskd_zygote_injected() {
     return false;
   }
 
-  write_uint8_t(fd, (uint8_t)ZygoteInjected);
+  safe_write(write_uint8_t(fd, (uint8_t)ZygoteInjected), "ZygoteInjected action", return false);
 
   close(fd);
 
@@ -75,12 +98,12 @@ uint32_t rezygiskd_get_process_flags(uid_t uid, const char *const process) {
     return 0;
   }
 
-  write_uint8_t(fd, (uint8_t)GetProcessFlags);
-  write_uint32_t(fd, (uint32_t)uid);
-  write_string(fd, process);
+  safe_write(write_uint8_t(fd, (uint8_t)GetProcessFlags), "GetProcessFlags action", return 0);
+  safe_write(write_uint32_t(fd, (uint32_t)uid), "uid", return 0);
+  safe_write(write_string(fd, process), "process name", return 0);
 
   uint32_t res = 0;
-  read_uint32_t(fd, &res);
+  safe_read(read_uint32_t(fd, &res), "process flags", return 0);
 
   close(fd);
 
@@ -99,19 +122,19 @@ void rezygiskd_get_info(struct rezygisk_info *info) {
 
   info->running = true;
 
-  write_uint8_t(fd, (uint8_t)GetInfo);
+  safe_write(write_uint8_t(fd, (uint8_t)GetInfo), "GetInfo action", return);
 
   uint32_t flags = 0;
-  read_uint32_t(fd, &flags);
+  safe_read(read_uint32_t(fd, &flags), "info flags", return);
 
-  if (flags & (1 << 27)) info->root_impl = ROOT_IMPL_APATCH;
+  if (flags & (1 << 28)) info->root_impl = ROOT_IMPL_APATCH;
   else if (flags & (1 << 29)) info->root_impl = ROOT_IMPL_KERNELSU;
   else if (flags & (1 << 30)) info->root_impl = ROOT_IMPL_MAGISK;
   else info->root_impl = ROOT_IMPL_NONE;
 
-  read_uint32_t(fd, (uint32_t *)&info->pid);
+  safe_read(read_uint32_t(fd, (uint32_t *)&info->pid), "pid", return);
 
-  read_size_t(fd, &info->modules.modules_count);
+  safe_read(read_size_t(fd, &info->modules.modules_count), "modules count", return);
   if (info->modules.modules_count == 0) {
     info->modules.modules = NULL;
 
@@ -157,7 +180,23 @@ void rezygiskd_get_info(struct rezygisk_info *info) {
     while (fgets(line, sizeof(line), module_prop) != NULL) {
       if (strncmp(line, "name=", strlen("name=")) != 0) continue;
 
-      info->modules.modules[i] = strndup(line + 5, strlen(line) - 6);
+      size_t name_len = strlen(line + strlen("name="));
+      if (name_len == 0 || line[name_len + strlen("name=") - 1] != '\n') {
+        LOGE("Invalid module name in %s", module_path);
+
+        fclose(module_prop);
+
+        goto info_cleanup;
+      }
+
+      info->modules.modules[i] = strndup(line + strlen("name="), name_len - 1);
+      if (info->modules.modules[i] == NULL) {
+        PLOGE("allocate memory for module name from %s", module_path);
+
+        fclose(module_prop);
+
+        goto info_cleanup;
+      }
 
       break;
     }
@@ -191,6 +230,7 @@ void free_rezygisk_info(struct rezygisk_info *info) {
 
   free(info->modules.modules);
   info->modules.modules = NULL;
+  info->modules.modules_count = 0;
 }
 
 bool rezygiskd_read_modules(struct zygisk_modules *modules) {
@@ -201,10 +241,10 @@ bool rezygiskd_read_modules(struct zygisk_modules *modules) {
     return false;
   }
 
-  write_uint8_t(fd, (uint8_t)ReadModules);
+  safe_write(write_uint8_t(fd, (uint8_t)ReadModules), "ReadModules action", return false);
 
   size_t len = 0;
-  read_size_t(fd, &len);
+  safe_read(read_size_t(fd, &len), "modules count", return false);
 
   modules->modules = malloc(len * sizeof(char *));
   if (!modules->modules) {
@@ -220,6 +260,9 @@ bool rezygiskd_read_modules(struct zygisk_modules *modules) {
     char *lib_path = read_string(fd);
     if (!lib_path) {
       PLOGE("reading module lib_path");
+
+      modules->modules_count = i;
+      free_modules(modules);
 
       close(fd);
 
@@ -240,6 +283,8 @@ void free_modules(struct zygisk_modules *modules) {
   }
 
   free(modules->modules);
+  modules->modules = NULL;
+  modules->modules_count = 0;
 }
 
 int rezygiskd_connect_companion(size_t index) {
@@ -250,11 +295,11 @@ int rezygiskd_connect_companion(size_t index) {
     return -1;
   }
 
-  write_uint8_t(fd, (uint8_t)RequestCompanionSocket);
-  write_size_t(fd, index);
+  safe_write(write_uint8_t(fd, (uint8_t)RequestCompanionSocket), "RequestCompanionSocket action", return -1);
+  safe_write(write_size_t(fd, index), "companion index", return -1);
 
   uint8_t res = 0;
-  read_uint8_t(fd, &res);
+  safe_read(read_uint8_t(fd, &res), "companion socket result", return -1);
 
   if (res == 1) return fd;
   else {
@@ -272,8 +317,8 @@ int rezygiskd_get_module_dir(size_t index) {
     return -1;
   }
 
-  write_uint8_t(fd, (uint8_t)GetModuleDir);
-  write_size_t(fd, index);
+  safe_write(write_uint8_t(fd, (uint8_t)GetModuleDir), "GetModuleDir action", return -1);
+  safe_write(write_size_t(fd, index), "module index", return -1);
 
   int dirfd = read_fd(fd);
 
@@ -285,28 +330,13 @@ int rezygiskd_get_module_dir(size_t index) {
 void rezygiskd_zygote_restart() {
   int fd = rezygiskd_connect(1);
   if (fd == -1) {
-    if (errno == ENOENT) LOGD("Could not notify ZygoteRestart (maybe it hasn't been created)");
-    else PLOGE("Could not notify ZygoteRestart");
+    if (errno == ENOENT) LOGD("Failed to connect to connect, file nonexistent (ReZygiskd not running?)");
+    else PLOGE("connection to ReZygiskd");
 
     return;
   }
 
-  if (!write_uint8_t(fd, (uint8_t)ZygoteRestart))
-    PLOGE("Failed to request ZygoteRestart");
-
-  close(fd);
-}
-
-void rezygiskd_system_server_started() {
-  int fd = rezygiskd_connect(1);
-  if (fd == -1) {
-    PLOGE("Failed to report system server started");
-
-    return;
-  }
-
-  if (!write_uint8_t(fd, (uint8_t)SystemServerStarted))
-    PLOGE("Failed to request SystemServerStarted");
+  safe_write(write_uint8_t(fd, (uint8_t)ZygoteRestart), "ZygoteRestart action", return);
 
   close(fd);
 }
@@ -319,27 +349,15 @@ bool rezygiskd_update_mns(enum mount_namespace_state nms_state, char *buf, size_
     return false;
   }
 
-  write_uint8_t(fd, (uint8_t)UpdateMountNamespace);
-  write_uint32_t(fd, (uint32_t)getpid());
-  write_uint8_t(fd, (uint8_t)nms_state);
+  safe_write(write_uint8_t(fd, (uint8_t)UpdateMountNamespace), "UpdateMountNamespace action", return false);
+  safe_write(write_uint32_t(fd, (uint32_t)getpid()), "pid", return false);
+  safe_write(write_uint8_t(fd, (uint8_t)nms_state), "mount namespace state", return false);
 
   uint32_t target_pid = 0;
-  if (read_uint32_t(fd, &target_pid) < 0) {
-    PLOGE("Failed to read target pid");
-
-    close(fd);
-
-    return false;
-  }
+  safe_read(read_uint32_t(fd, &target_pid), "target pid", return false);
 
   uint32_t target_fd = 0;
-  if (read_uint32_t(fd, &target_fd) < 0) {
-    PLOGE("Failed to read target fd");
-
-    close(fd);
-
-    return false;
-  }
+  safe_read(read_uint32_t(fd, &target_fd), "target fd", return false);
 
   if (target_fd == 0) {
     LOGE("Failed to get target fd");
@@ -355,3 +373,25 @@ bool rezygiskd_update_mns(enum mount_namespace_state nms_state, char *buf, size_
 
   return true;
 }
+
+bool rezygiskd_remove_module(size_t index) {
+  int fd = rezygiskd_connect(1);
+  if (fd == -1) {
+    PLOGE("connection to ReZygiskd");
+
+    return false;
+  }
+
+  safe_write(write_uint8_t(fd, (uint8_t)RemoveModule), "RemoveModule action", return false);
+  safe_write(write_size_t(fd, index), "module index", return false);
+
+  uint8_t res = 0;
+  safe_read(read_uint8_t(fd, &res), "remove module result", return false);
+
+  close(fd);
+
+  return res == 1;
+}
+
+#undef safe_read
+#undef safe_write

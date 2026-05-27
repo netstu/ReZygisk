@@ -2,21 +2,13 @@
 #define CONSTANTS_H
 
 #include <stdbool.h>
-
-#include <android/log.h>
-
-#if (defined(__LP64__) || defined(_LP64))
-  #define lp_select(a, b) b
-#else
-  #define lp_select(a, b) a
-#endif
+#include <stdint.h>
 
 #define PROCESS_NAME_MAX_LEN 256 + 1
 
-#define ZYGOTE_INJECTED lp_select(5, 4)
-#define DAEMON_SET_INFO lp_select(7, 6)
-#define DAEMON_SET_ERROR_INFO lp_select(9, 8)
-#define SYSTEM_SERVER_STARTED 10
+#define ZYGOTE_INJECTED LP_SELECT(5, 4)
+#define DAEMON_SET_INFO LP_SELECT(7, 6)
+#define DAEMON_SET_ERROR_INFO LP_SELECT(9, 8)
 
 enum DaemonSocketAction {
   ZygoteInjected         = 0,
@@ -26,8 +18,8 @@ enum DaemonSocketAction {
   RequestCompanionSocket = 4,
   GetModuleDir           = 5,
   ZygoteRestart          = 6,
-  SystemServerStarted    = 7,
-  UpdateMountNamespace   = 8
+  UpdateMountNamespace   = 7,
+  RemoveModule           = 8
 };
 
 enum ProcessFlags: uint32_t {

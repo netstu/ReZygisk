@@ -1,16 +1,15 @@
 #ifndef LOGGING_H
 #define LOGGING_H
 
-#include <android/log.h>
 #include <errno.h>
 #include <string.h>
 
+#include <android/log.h>
+
+#include "misc.h"
+
 #ifndef LOG_TAG
-  #ifdef __LP64__
-    #define LOG_TAG "zygisk-core64"
-  #else
-    #define LOG_TAG "zygisk-core32"
-  #endif
+  #define LOG_TAG "zygisk-core" LP_SELECT("32", "64")
 #endif
 
 #ifndef NDEBUG

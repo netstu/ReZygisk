@@ -1,15 +1,18 @@
-#include <linux/seccomp.h>
-#include <linux/filter.h>
-#include <linux/audit.h>
-#include <sys/prctl.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
 
+#include <fcntl.h>
+#include <sys/syscall.h>
+
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <sys/prctl.h>
+#include <unistd.h>
+
 #include "logging.h"
+
+#include "ptrace_clear.h"
 
 static bool seccomp_filters_visible() {
   FILE *status_file = fopen("/proc/self/status", "r");

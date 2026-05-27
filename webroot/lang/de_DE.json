@@ -1,34 +1,15 @@
 {
-  "langName": "Deutsch",
-  "global": {
-    "unknown": "Unbekannt"
-  },
-  "smallPage": {
-    "language": {
-      "header": "Neue Sprache wählen"
-    },
-    "theme": {
-      "header": "Neues Theme wählen",
-      "dark": "Dunkel",
-      "light": "Hell",
-      "system": "System Basiert"
-    },
-    "errorh": {
-      "buttons": {
-        "copy": "Kopieren",
-        "clear": "ALLE LOGS LÖSCHEN"
-      },
-      "header": "Fehler Verlauf",
-      "placeholder": "Es wurde kein Fehlerprotokoll aufgezeichnet!"
-    }
-  },
-  "page": {
+  "langName": "Deutsch (Deutschland)",
+  "pages": {
     "home": {
-      "header": "Startseite",
+      "title": "Start",
+      "unknown": "Unbekannt",
+      "androidVersion": "Android Version",
+      "linuxKernelVersion": "Linux Kernel Version",
       "status": {
-        "notWorking": "Funktioniert nicht",
+        "notWorking": "Funktioniert Nicht",
         "ok": "Funktioniert",
-        "partially": "Funktioniert zum Teil"
+        "partially": "Funktioniert Teilweise"
       },
       "info": {
         "version": "Version",
@@ -40,54 +21,66 @@
         }
       }
     },
+    "actions": {
+      "title": "Aktionen",
+      "monitor": {
+        "title": "Monitor",
+        "status": {
+          "tracing": "Verfolge",
+          "stopping": "Stoppe",
+          "stopped": "Gestoppt",
+          "exiting": "Beende",
+          "unknown": "Unbekannt"
+        },
+        "button": {
+          "start": "Start",
+          "stop": "Stop",
+          "pause": "Pause"
+        }
+      }
+    },
     "modules": {
-      "header": "Module",
-      "notAvaliable": "Kein Modul nutzt Zygisk.",
+      "title": "Module",
+      "notAvaliable": "Keine Zygisk-Module hier ...",
       "arch": "Architektur: "
     },
     "settings": {
-      "header": "Einstellungen",
-      "font": {
-        "header": "Systemschriftart aktivieren",
-        "description": "Diese Option aktiviert die Systemschriftart in der aktuellen WebUI. HINWEIS: Möglicherweise nicht kompatibel mit FlipFont"
+      "title": "Einstellungen",
+      "language": {
+        "title": "Sprache wechseln",
+        "description": "Wechsel zur ausgewählten Sprache."
+      },
+      "fullscreen": {
+        "title": "WebUI-Vollbildmodus deaktivieren",
+        "description": "Lässt die WebUI nicht den kompletten Bildschirm einnehmen"
       },
       "theme": {
-        "header": "System Theme",
-        "description": "Wählen Sie Ihr System-Theme für die aktuelle WebUI"
+        "title": " WebUI Design",
+        "description": "Wähle dein Design für die WebUI"
       },
-      "language": {
-        "header": "Sprache auswählen",
-        "description": "Wechsel zu deiner neuen Sprache"
+      "font": {
+        "title": "System Schriftart benutzen",
+        "description": "Benutze die System Schriftart, Achtung: möglicherweise inkompatibel mit FLIPFONT"
       },
-      "logs": {
-        "header": "Fehler Verlauf",
-        "description": "Zeige den Fehler Verlauf"
-      },
-      "credits": {
-        "module": "Modul Entwickler",
-        "original": "Original Modul Entwickler",
-        "web": "WebUI Entwickler"
-      },
-      "license": {
-        "module": "Modul Lizenz",
-        "web": "WebUI Lizenz"
-      }
+      "moduleDevelopers": "Modul Entwickler*innen",
+      "WebUIDevelopers": "WebUI Entwickler*innen",
+      "orginalDevelopers": "Original Modul Entwickler*innen",
+      "moduleLicense": "Modul Lizenz"
     },
-    "actions": {
-      "header": "Aktionen",
-      "monitorButton": {
-        "pause": "Pause",
-        "stop": "Stopp",
-        "start": "Start"
-      },
-      "monitor": "Überwachen",
-      "status": {
-        "tracing": "Nachverfolgung",
-        "stopping": "Beenden",
-        "stopped": "Beendet",
-        "exiting": "Wird Beendet",
-        "unknown": "Unbekannt"
+    "mini_settings_language": {
+      "title": "Sprache auswählen"
+    },
+    "mini_settings_theme": {
+      "title": "WebUI Design auswählen",
+      "theme": {
+        "dark": "Dunkles Design",
+        "light": "Helles Design",
+        "amoled": "Amoled Design",
+        "system_based": "System Design"
       }
     }
+  },
+  "globals": {
+    "unknown": "Unbekannt"
   }
 }

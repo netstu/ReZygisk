@@ -1,12 +1,12 @@
-#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-#include <sys/stat.h>
-#include <sys/prctl.h>
-#include <sys/ioctl.h>
 
 #include <unistd.h>
+#include <sys/ioctl.h>
+#include <sys/prctl.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/system_properties.h>
 
 #include "../constants.h"
 #include "../utils.h"
@@ -52,7 +52,7 @@ struct ksu_set_feature_cmd {
 };
 
 struct ksu_get_hook_mode_cmd {
-	char mode[16];
+  char mode[16];
 };
 
 #define KSU_IOCTL_UID_GRANTED_ROOT _IOC(_IOC_READ|_IOC_WRITE, 'K', 8, 0)
@@ -71,8 +71,20 @@ static bool supports_manager_uid_retrieval = false;
 static bool ksu_uses_new_ksuctl = false;
 
 void ksu_get_existence(struct root_impl_state *state) {
+  char platform[PROP_VALUE_MAX];
+  get_property("ro.board.platform", platform);
+
+  /* INFO: On Waydroid, the SYS_reboot call will trigger a SIGSYS signal, resulting
+             in the crash of ReZygiskd. To avoid that, read the platform property
+             and not try to call KernelSU v3 interface, jumping to KernelSU v1
+             interface which doesn't require the SYS_reboot call. */
+  if (strcmp(platform, "waydroid") == 0)
+    goto try_prctl;
+
   syscall(SYS_reboot, KSU_INSTALL_MAGIC1, KSU_INSTALL_MAGIC2, 0, (void *)&ksu_fd);
   if (ksu_fd == -1) {
+    try_prctl:
+
     /* INFO: Perhaps it uses the old ksuctl interface */
     int reply_ok = 0;
 
@@ -85,13 +97,10 @@ void ksu_get_existence(struct root_impl_state *state) {
               Some users don't want to use KernelSU, but, for example, Magisk.
               This if allows this to happen, as it checks if "ksud" exists,
               which in case it doesn't, it won't be considered as supported. */
-      struct stat s;
-      if (stat("/data/adb/ksud", &s) == -1) {
-        if (errno != ENOENT) {
-          LOGE("Failed to stat KSU daemon: %s\n", strerror(errno));
-        }
-        errno = 0;
-        state->state = Abnormal;
+      if (access("/data/adb/ksu/bin/ksud", F_OK) == -1) {
+        LOGW("KernelSU %d detected, but ksud not found.", version);
+
+        state->state = Inexistent;
 
         return;
       }
@@ -119,6 +128,14 @@ void ksu_get_existence(struct root_impl_state *state) {
     }
     else if (version >= 1 && version <= MIN_KSU_VERSION - 1) state->state = TooOld;
     else state->state = Abnormal;
+
+    return;
+  }
+
+  if (access("/data/adb/ksu/bin/ksud", F_OK) == -1) {
+    LOGW("KernelSU (ioctl) detected, but ksud not found.");
+
+    state->state = Inexistent;
 
     return;
   }
@@ -213,17 +230,16 @@ bool ksu_uid_is_manager(uid_t uid) {
     }
 
     const char *manager_path = ksu_manager_paths[variant];
-    struct stat s;
-    if (stat(manager_path, &s) == -1) {
+    struct stat st;
+    if (stat(manager_path, &st) == -1) {
       if (errno != ENOENT) {
-        LOGE("Failed to stat KSU manager data directory: %s\n", strerror(errno));
+        LOGE("Failed to stat KSU manager data directory: %s", strerror(errno));
       }
-      errno = 0;
 
       return false;
     }
 
-    return s.st_uid == uid;
+    return st.st_uid == uid;
   }
 
   /* INFO: If it uses ioctl, it already has support to get manager UID operation */
@@ -234,7 +250,9 @@ bool ksu_uid_is_manager(uid_t uid) {
     return false;
   }
 
-  return uid == cmd.uid;
+  /* INFO: For Private Space, UID will be 10xxxxx, being xxxxx the original UID. To check if
+             the UID is the manager UID in Private Space, we "normalize" it with the modulo operator. */
+  return uid % 100000 == cmd.uid;
 }
 
 void ksu_cleanup(void) {

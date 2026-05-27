@@ -5,14 +5,6 @@
 
 #include <unistd.h>
 
-#ifdef __LP64__
-  #define LP_SELECT(lp32, lp64) lp64
-#else
-  #define LP_SELECT(lp32, lp64) lp32
-#endif
-
-#define SOCKET_FILE_NAME LP_SELECT("cp32", "cp64") ".sock"
-
 enum rezygiskd_actions {
   ZygoteInjected,
   GetProcessFlags,
@@ -21,8 +13,8 @@ enum rezygiskd_actions {
   RequestCompanionSocket,
   GetModuleDir,
   ZygoteRestart,
-  SystemServerStarted,
-  UpdateMountNamespace
+  UpdateMountNamespace,
+  RemoveModule
 };
 
 struct zygisk_modules {
@@ -75,8 +67,8 @@ int rezygiskd_get_module_dir(size_t index);
 
 void rezygiskd_zygote_restart();
 
-void rezygiskd_system_server_started();
-
 bool rezygiskd_update_mns(enum mount_namespace_state nms_state, char *buf, size_t buf_size);
+
+bool rezygiskd_remove_module(size_t index);
 
 #endif /* DAEMON_H */

@@ -1,8 +1,9 @@
 #include <stdlib.h>
+#include <string.h>
 #include <errno.h>
-#include <sys/socket.h>
 
 #include <unistd.h>
+#include <sys/socket.h>
 
 #include "logging.h"
 
@@ -13,9 +14,20 @@ ssize_t write_loop(int fd, const void *buf, size_t count) {
   while (written < (ssize_t)count) {
     ssize_t ret = write(fd, (const char *)buf + written, count - written);
     if (ret == -1) {
-      if (errno == EINTR || errno == EAGAIN) continue;
+      if (errno == EAGAIN) {
+        LOGW("Got EAGAIN while writing to fd %d, retrying...\n", fd);
+
+        /* INFO: Sleep for 1ms*/
+        usleep(1000);
+
+        continue;
+      }
+
+      if (errno == EINTR) continue;
 
       PLOGE("write");
+
+      return -1;
     }
 
     if (ret == 0) {
@@ -43,7 +55,16 @@ ssize_t read_loop_offset(int fd, void *buf, size_t count, off_t off) {
     char *dst = (char *)buf + read_bytes;
     ssize_t ret = pread(fd, dst, remaining, off + read_bytes);
     if (ret == -1) {
-      if (errno == EINTR || errno == EAGAIN) continue;
+      if (errno == EAGAIN) {
+        LOGW("Got EAGAIN while writing to fd %d, retrying...\n", fd);
+
+        /* INFO: Sleep for 1ms*/
+        usleep(1000);
+
+        continue;
+      }
+
+      if (errno == EINTR) continue;
 
       PLOGE("read");
 
@@ -88,6 +109,39 @@ ssize_t read_loop(int fd, void *buf, size_t count) {
   return read_bytes;
 }
 
+ssize_t write_fd(int fd, int sendfd) {
+  char cmsgbuf[CMSG_SPACE(sizeof(int))];
+  char buf[1] = { 0 };
+
+  struct iovec iov = {
+    .iov_base = buf,
+    .iov_len = 1
+  };
+
+  struct msghdr msg = {
+    .msg_iov = &iov,
+    .msg_iovlen = 1,
+    .msg_control = cmsgbuf,
+    .msg_controllen = sizeof(cmsgbuf)
+  };
+
+  struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+  cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+  cmsg->cmsg_level = SOL_SOCKET;
+  cmsg->cmsg_type = SCM_RIGHTS;
+
+  memcpy(CMSG_DATA(cmsg), &sendfd, sizeof(int));
+
+  ssize_t ret = sendmsg(fd, &msg, 0);
+  if (ret == -1) {
+    LOGE("sendmsg: %s\n", strerror(errno));
+
+    return -1;
+  }
+
+  return ret;
+}
+
 /* TODO: Standardize how to log errors */
 int read_fd(int fd) {
   char cmsgbuf[CMSG_SPACE(sizeof(int))];
@@ -112,15 +166,22 @@ int read_fd(int fd) {
     return -1;
   }
 
-  struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-  if (cmsg == NULL) {
-    PLOGE("CMSG_FIRSTHDR");
+  struct cmsghdr *cmsg;
+  int sendfd = -1;
+
+  for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+    if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS || cmsg->cmsg_len < CMSG_LEN(sizeof(int))) continue;
+
+    memcpy(&sendfd, CMSG_DATA(cmsg), sizeof(int));
+
+    break;
+  }
+
+  if (sendfd == -1) {
+    LOGE("Failed to receive fd: No valid fd found in ancillary data.");
 
     return -1;
   }
-
-  int sendfd;
-  memcpy(&sendfd, CMSG_DATA(cmsg), sizeof(int));
 
   return sendfd;
 }
@@ -169,7 +230,7 @@ char *read_string(int fd) {
     return NULL;
   }
 
-  if (str_len > 0) buf[str_len] = '\0';
+  buf[str_len] = '\0';
 
   return buf;
 }
